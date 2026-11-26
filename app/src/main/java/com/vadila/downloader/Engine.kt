@@ -24,6 +24,9 @@ import kotlin.math.min
 
 enum class Status { QUEUED, RUNNING, PAUSED, DONE, FAILED }
 
+/** Thrown by the direct-file probe when the link must go through the media extractor. */
+class NeedsExtractor : Exception()
+
 class Segment(val start: Long, val end: Long, done: Long) {
     val done = AtomicLong(done)
     @Volatile var finishedUnknown = false
@@ -45,13 +48,18 @@ class Task(val id: Long, val url: String) {
     @Volatile var pauseRequested = false
     @Volatile var removed = false
     @Volatile var segments: List<Segment> = emptyList()
+    /** true when the link is a web page handled by yt-dlp instead of a direct file. */
+    @Volatile var media = false
+    @Volatile var progressPct = -1f
+    @Volatile var eta = -1L
+    @Volatile var statusLine = ""
 
     fun downloaded(): Long = segments.sumOf { it.done.get() }
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id); put("url", url); put("finalUrl", finalUrl)
         put("name", fileName); put("mime", mime); put("total", totalBytes)
-        put("ranges", supportsRanges); put("status", status.name)
+        put("ranges", supportsRanges); put("status", status.name); put("media", media)
         put("error", error ?: ""); put("uri", savedUri ?: "")
         val arr = JSONArray()
         for (s in segments) arr.put(JSONObject().apply {
@@ -68,6 +76,7 @@ class Task(val id: Long, val url: String) {
             t.mime = o.optString("mime")
             t.totalBytes = o.optLong("total", -1)
             t.supportsRanges = o.optBoolean("ranges")
+            t.media = o.optBoolean("media")
             t.status = runCatching { Status.valueOf(o.optString("status")) }.getOrDefault(Status.PAUSED)
             t.error = o.optString("error").ifEmpty { null }
             t.savedUri = o.optString("uri").ifEmpty { null }
@@ -81,6 +90,7 @@ class Task(val id: Long, val url: String) {
             // Downloads that were interrupted by the app closing wait for the user.
             if (t.status == Status.RUNNING || t.status == Status.QUEUED) t.status = Status.PAUSED
             if (!t.supportsRanges && t.status != Status.DONE) t.segments = emptyList()
+            if (t.media && t.status == Status.DONE) t.progressPct = 100f
             return t
         }
     }
@@ -139,7 +149,23 @@ object Engine {
             for (i in 0 until arr.length()) tasks.add(Task.fromJson(arr.getJSONObject(i)))
         }
         nextId = (tasks.maxOfOrNull { it.id } ?: 0L) + 1
+        // Keep the extractor fresh: sites change often, so update yt-dlp every 3 days.
+        val last = prefs.getLong("ytdlpUpdated", 0)
+        if (System.currentTimeMillis() - last > 3L * 24 * 3600 * 1000) {
+            Thread {
+                runCatching {
+                    Media.update(ctx)
+                    prefs.edit().putLong("ytdlpUpdated", System.currentTimeMillis()).apply()
+                }
+            }.start()
+        }
     }
+
+    fun updateExtractor(): String = runCatching {
+        val msg = Media.update(ctx)
+        prefs.edit().putLong("ytdlpUpdated", System.currentTimeMillis()).apply()
+        msg
+    }.getOrElse { "تعذّر التحديث: " + (it.message ?: "").take(150) }
 
     private fun stateFile() = File(ctx.filesDir, "tasks.json")
     private fun tempFile(t: Task) = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "part_${t.id}")
@@ -174,7 +200,7 @@ object Engine {
     fun pause(id: Long) {
         val t = tasks.find { it.id == id } ?: return
         when (t.status) {
-            Status.RUNNING -> { t.pauseRequested = true; t.stop = true }
+            Status.RUNNING -> { t.pauseRequested = true; t.stop = true; if (t.media) Media.cancel(t) }
             Status.QUEUED -> t.status = Status.PAUSED
             else -> {}
         }
@@ -196,8 +222,9 @@ object Engine {
         val t = tasks.find { it.id == id } ?: return
         t.removed = true
         t.stop = true
+        if (t.media) Media.cancel(t)
         tasks.remove(t)
-        if (t.status != Status.RUNNING) tempFile(t).delete()
+        if (t.status != Status.RUNNING) { tempFile(t).delete(); mediaDir(t).deleteRecursively() }
         save()
         schedule()
     }
@@ -231,6 +258,7 @@ object Engine {
                 t.pauseRequested = false
                 t.error = null
                 t.speed = 0
+                if (t.media && t.status != Status.DONE) t.statusLine = ""
                 active++
                 Thread({ runTask(t) }, "task-${t.id}").start()
             }
@@ -268,7 +296,7 @@ object Engine {
                 url = URL(URL(url), loc).toString()
                 return@repeat
             }
-            if (code >= 400) { c.disconnect(); throw IOException("ردّ الخادم بالخطأ $code") }
+            if (code >= 400) { c.disconnect(); throw NeedsExtractor() }
             t.finalUrl = url
             return c
         }
@@ -279,9 +307,10 @@ object Engine {
         val conn = resolve(t)
         val url = t.finalUrl
         val type = conn.contentType ?: ""
-        if (type.startsWith("text/html", ignoreCase = true)) {
+        val lowType = type.lowercase()
+        if (lowType.startsWith("text/html") || "mpegurl" in lowType || "dash+xml" in lowType) {
             conn.disconnect()
-            throw IOException("هذا رابط صفحة ويب وليس رابط ملف مباشر")
+            throw NeedsExtractor()
         }
         val contentRange = conn.getHeaderField("Content-Range")
         if (conn.responseCode == 206 && contentRange != null) {
@@ -312,12 +341,48 @@ object Engine {
         }
     }
 
+    private fun mediaDir(t: Task) = File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, "media_${t.id}")
+
+    private fun runMedia(t: Task) {
+        t.media = true
+        t.segments = emptyList()
+        save()
+        val dir = mediaDir(t)
+        val files = Media.download(ctx, t, dir, connections, Limiter.bytesPerSec)
+        var total = 0L
+        for (f in files) {
+            val ext = f.name.substringAfterLast('.', "").lowercase()
+            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+            total += f.length()
+            t.savedUri = publishFile(f.name, mime, f).toString()
+            t.mime = mime
+        }
+        t.fileName = if (files.size == 1) files[0].name else "${files.size} ملفات"
+        t.totalBytes = total
+        t.progressPct = 100f
+        dir.deleteRecursively()
+    }
+
     private fun runTask(t: Task) {
         val temp = tempFile(t)
         try {
-            if (t.segments.isEmpty()) {
+            if (!t.media && t.segments.isEmpty()) {
                 temp.delete()
-                probe(t)
+                try { probe(t) } catch (e: NeedsExtractor) { t.media = true } catch (e: IOException) {
+                    // Sites that refuse simple requests usually still work through the extractor.
+                    if (t.url.startsWith("http")) t.media = true else throw e
+                }
+            }
+            if (t.media) {
+                t.speed = 0
+                runMedia(t)
+                t.speed = 0
+                when {
+                    t.removed -> mediaDir(t).deleteRecursively()
+                    t.pauseRequested -> t.status = Status.PAUSED
+                    else -> t.status = Status.DONE
+                }
+                return
             }
             save()
             RandomAccessFile(temp, "rw").use { raf ->
@@ -358,14 +423,14 @@ object Engine {
                 }
                 else -> {
                     if (t.totalBytes < 0) t.totalBytes = temp.length()
-                    t.savedUri = publish(t, temp).toString()
+                    t.savedUri = publishFile(t.fileName.ifBlank { "file_${t.id}" }, t.mime, temp).toString()
                     temp.delete()
                     t.status = Status.DONE
                 }
             }
         } catch (e: Throwable) {
             t.speed = 0
-            if (t.removed) { temp.delete(); return }
+            if (t.removed) { temp.delete(); if (t.media) mediaDir(t).deleteRecursively(); return }
             if (t.pauseRequested) t.status = Status.PAUSED
             else { t.status = Status.FAILED; t.error = e.message ?: e.javaClass.simpleName }
         } finally {
@@ -422,11 +487,11 @@ object Engine {
     }
 
     /** Copies the finished file into the public Download/Downloader folder. */
-    private fun publish(t: Task, temp: File): Uri {
+    private fun publishFile(name: String, mime: String, temp: File): Uri {
         val resolver = ctx.contentResolver
         val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, t.fileName.ifBlank { "file_${t.id}" })
-            put(MediaStore.Downloads.MIME_TYPE, t.mime.ifBlank { "application/octet-stream" })
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, mime.ifBlank { "application/octet-stream" })
             put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Downloader")
             put(MediaStore.Downloads.IS_PENDING, 1)
         }

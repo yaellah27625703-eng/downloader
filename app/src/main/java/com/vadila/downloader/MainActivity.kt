@@ -64,7 +64,7 @@ class MainActivity : Activity() {
         }
 
         input = EditText(this).apply {
-            hint = "ضع رابطًا مباشرًا أو أكثر (كل رابط في سطر)"
+            hint = "ضع رابط فيديو أو ملف أو صفحة (كل رابط في سطر)"
             minLines = 2
             maxLines = 5
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
@@ -86,7 +86,7 @@ class MainActivity : Activity() {
         root.addView(summary)
 
         empty = TextView(this).apply {
-            text = "لا توجد تنزيلات بعد.\nالصق رابط ملف مباشر (فيديو، صورة، صوت، ملف مضغوط...) ثم اضغط تنزيل،\nأو شارك الرابط إلى هذا التطبيق من أي تطبيق آخر."
+            text = "لا توجد تنزيلات بعد.\nالصق رابط فيديو من يوتيوب أو تيك توك أو فيسبوك أو إنستغرام أو X، أو رابط أي ملف، ثم اضغط تنزيل.\nويمكنك مشاركة الرابط إلى هذا التطبيق من أي تطبيق آخر."
             gravity = Gravity.CENTER
             setPadding(dp(8), dp(32), dp(8), dp(8))
         }
@@ -126,6 +126,7 @@ class MainActivity : Activity() {
         menu.add(0, 1, 0, "استئناف الكل")
         menu.add(0, 2, 1, "إيقاف الكل")
         menu.add(0, 3, 2, "مسح المكتملة من القائمة")
+        menu.add(0, 4, 3, "تحديث محرك التنزيل")
         return true
     }
 
@@ -134,6 +135,13 @@ class MainActivity : Activity() {
             1 -> Engine.resumeAll()
             2 -> Engine.pauseAll()
             3 -> Engine.clearFinished()
+            4 -> {
+                toast("جارٍ تحديث محرك التنزيل…")
+                Thread {
+                    val msg = Engine.updateExtractor()
+                    runOnUiThread { toast(msg) }
+                }.start()
+            }
             else -> return super.onOptionsItemSelected(item)
         }
         return true
@@ -277,8 +285,28 @@ class MainActivity : Activity() {
             return view
         }
 
+        private fun bindMedia(h: Holder, t: Task) {
+            val pct = t.progressPct
+            if (t.status == Status.RUNNING && pct < 0) h.bar.isIndeterminate = true
+            else { h.bar.isIndeterminate = false; h.bar.progress = (pct.coerceIn(0f, 100f) * 10).toInt() }
+            val pctText = if (pct >= 0) "${pct.toInt()}%" else ""
+            val size = if (t.totalBytes > 0) " • ${Engine.fmtBytes(t.totalBytes)}" else ""
+            val eta = if (t.eta > 0) " • متبقٍّ ${t.eta / 60}:${"%02d".format(t.eta % 60)}" else ""
+            h.info.text = when (t.status) {
+                Status.RUNNING -> if (t.pauseRequested) "جارٍ الإيقاف…" else
+                    listOf("يُنزَّل (صفحة/فيديو)", t.statusLine, pctText).filter { it.isNotBlank() }.joinToString(" • ") +
+                        "$size • ${Engine.fmtBytes(t.speed)}/ث$eta"
+                Status.QUEUED -> "في الانتظار"
+                Status.PAUSED -> "متوقف مؤقتًا" + (if (pctText.isNotEmpty()) " • $pctText" else "")
+                Status.DONE -> "اكتمل • ${Engine.fmtBytes(t.totalBytes)} • في مجلد Download/Downloader"
+                Status.FAILED -> "فشل: ${t.error ?: "خطأ غير معروف"}"
+            }
+        }
+
         private fun bind(h: Holder, t: Task) {
             h.name.text = t.fileName.ifBlank { t.url }
+            bindButtons(h, t)
+            if (t.media) { bindMedia(h, t); return }
             val done = t.downloaded()
             val total = t.totalBytes
             when {
@@ -297,7 +325,9 @@ class MainActivity : Activity() {
                 Status.DONE -> "اكتمل • ${Engine.fmtBytes(total)} • في مجلد Download/Downloader"
                 Status.FAILED -> "فشل: ${t.error ?: "خطأ غير معروف"}"
             }
+        }
 
+        private fun bindButtons(h: Holder, t: Task) {
             h.action.visibility = if (t.status == Status.DONE) View.GONE else View.VISIBLE
             h.action.text = when (t.status) {
                 Status.RUNNING, Status.QUEUED -> "إيقاف"
