@@ -36,6 +36,8 @@ class Segment(val start: Long, end: Long, done: Long) {
     val done = AtomicLong(done)
     @Volatile var finishedUnknown = false
     @Volatile var active = false
+    /** This connection's own measured speed (bytes/s). */
+    @Volatile var speed = 0L
     fun remaining(): Long = if (end >= 0) end - start - done.get() + 1 else Long.MAX_VALUE
     fun complete(): Boolean =
         if (end >= 0) done.get() >= end - start + 1 else finishedUnknown
@@ -582,11 +584,19 @@ object Engine {
     /** Takes over the second half of the largest part still being downloaded. */
     private fun splitLargest(t: Task): Segment? {
         synchronized(t) {
+            // Help the part that would finish last (big AND/OR slow), not just the biggest one.
+            val avg = max(1024L, t.speed / max(1, t.activeConns))
+            fun eta(sg: Segment) = sg.remaining() * 1000 / max(1024L, if (sg.speed > 0) sg.speed else avg)
             val victim = t.segments
-                .filter { it.end >= 0 && it.active && !it.complete() }
-                .maxByOrNull { it.remaining() } ?: return null
+                .filter { it.end >= 0 && it.active && !it.complete() && it.remaining() >= 2 * MIN_PIECE }
+                .maxByOrNull { eta(it) } ?: return null
             val rem = victim.remaining()
-            if (rem < 2 * STEAL_MIN) return null
+            // Big parts are always shared. Small ones (end game) only when that really finishes sooner:
+            // the part must still need over a second and a fresh connection must beat its owner.
+            if (rem < 2 * STEAL_MIN) {
+                val ownerSpeed = if (victim.speed > 0) victim.speed else avg
+                if (eta(victim) < 700 || ownerSpeed * 2 > avg * 3) return null
+            }
             val mid = victim.start + victim.done.get() + rem / 2
             val ns = Segment(mid, victim.end, 0)
             victim.end = mid - 1
@@ -595,7 +605,8 @@ object Engine {
         }
     }
 
-    private const val STEAL_MIN = 512L * 1024
+    private const val STEAL_MIN = 256L * 1024
+    private const val MIN_PIECE = 48L * 1024
     private const val BUF = 256 * 1024
 
     private fun runSegment(t: Task, seg: Segment, temp: File) {
@@ -648,11 +659,12 @@ object Engine {
                         // Drop a connection that stays far slower than the others and open a fresh one.
                         winBytes += n
                         val now = SystemClock.elapsedRealtime()
-                        if (now - winStart >= 4000) {
+                        if (now - winStart >= 1000) {
                             val mine = winBytes * 1000 / (now - winStart)
+                            seg.speed = if (seg.speed == 0L) mine else (seg.speed + mine) / 2
                             val avg = t.speed / max(1, t.activeConns)
-                            slow = if (t.activeConns > 1 && avg > 32 * 1024 && mine < avg / 4 &&
-                                seg.remaining() > 2L * 1024 * 1024 && Limiter.bytesPerSec <= 0
+                            slow = if (t.activeConns > 1 && avg > 32 * 1024 && mine < avg / 3 &&
+                                seg.remaining() > 2 * MIN_PIECE && Limiter.bytesPerSec <= 0
                             ) slow + 1 else 0
                             winBytes = 0
                             winStart = now
@@ -660,8 +672,12 @@ object Engine {
                         }
                     }
                     if (t.stop) return
-                    if (seg.end < 0) {
-                        if (ended) seg.finishedUnknown = true
+                    if (seg.end < 0 && ended) {
+                        // A cut connection can look like a normal end: check against the announced size.
+                        if (t.totalBytes > 0 && seg.done.get() < t.totalBytes) {
+                            throw IOException("انقطع الاتصال قبل اكتمال الملف")
+                        }
+                        seg.finishedUnknown = true
                     }
                     reusable = !overshoot && (ended || seg.complete())
                     if (reusable) input.close() // return the socket to the keep-alive pool
@@ -669,7 +685,7 @@ object Engine {
                 if (t.stop) return
                 if (!seg.complete()) throw IOException("انقطع الاتصال قبل اكتمال الجزء")
             } catch (e: Reconnect) {
-                // open a new connection immediately
+                seg.speed = 0 // open a new connection immediately
             } catch (e: Exception) {
                 if (t.stop) return
                 attempts++
