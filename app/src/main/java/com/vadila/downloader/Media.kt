@@ -59,12 +59,15 @@ object Media {
         t.statusLine = "جارٍ قراءة الرابط…"
         val req = YoutubeDLRequest(t.url)
             .addOption("-o", dir.absolutePath + "/%(title).120B [%(id)s].%(ext)s")
-            .addOption("-f", "bv*+ba/b")
-            .addOption("--merge-output-format", "mp4")
             .addOption("-N", connections.coerceIn(1, 16))
             .addOption("--no-mtime")
             .addOption("--no-playlist")
+        for ((k, v) in Quality.ytdlpOptions(t.quality)) {
+            if (v == null) req.addOption(k) else req.addOption(k, v)
+        }
         if (limitBytes > 0) req.addOption("-r", limitBytes.toString())
+        if (t.referer.isNotBlank()) req.addOption("--referer", t.referer)
+        if (t.userAgent.isNotBlank()) req.addOption("--user-agent", t.userAgent)
 
         var parts = 0
         try {
@@ -91,6 +94,43 @@ object Media {
         }.orEmpty()
         if (files.isEmpty()) throw IOException("لم يُعثر على ملف بعد التنزيل")
         return files
+    }
+
+    /** Reads the qualities that really exist for [url] (with approximate sizes). */
+    fun fetchQualities(ctx: Context, url: String): Quality.Available {
+        ensureInit(ctx)
+        val info = try {
+            YoutubeDL.getInstance().getInfo(YoutubeDLRequest(url).addOption("--no-playlist"))
+        } catch (e: Exception) {
+            throw IOException(friendlyError(e.message ?: ""))
+        }
+        val formats = info.formats.orEmpty()
+        val duration = info.duration
+        fun size(f: com.yausername.youtubedl_android.mapper.VideoFormat): Long = when {
+            f.fileSize > 0 -> f.fileSize
+            f.fileSizeApproximate > 0 -> f.fileSizeApproximate
+            f.tbr > 0 && duration > 0 -> f.tbr.toLong() * 1000 / 8 * duration
+            else -> 0L
+        }
+        fun none(c: String?) = c == null || c == "none"
+        val audioOnly = formats.filter { none(it.vcodec) && !none(it.acodec) }
+        val bestAudio = audioOnly.maxOfOrNull { size(it) } ?: 0L
+        val byHeight = formats.filter { it.height > 0 && !none(it.vcodec) }.groupBy { it.height }
+
+        val options = ArrayList<Quality.Option>()
+        options.add(Quality.Option("best", Quality.label("best")))
+        for (h in byHeight.keys.sortedDescending()) {
+            val fs = byHeight.getValue(h)
+            val best = fs.maxByOrNull { size(it) }
+            val s = if (best == null) 0L else size(best) + (if (none(best.acodec)) bestAudio else 0L)
+            options.add(Quality.Option(h.toString(), "${h}p" + Quality.heightTag(h) + Quality.sizeText(s)))
+        }
+        if (byHeight.size > 1) options.add(Quality.Option("low", Quality.label("low")))
+        if (audioOnly.isNotEmpty() || byHeight.isNotEmpty()) {
+            options.add(Quality.Option("mp3", Quality.label("mp3") + Quality.sizeText(bestAudio)))
+            options.add(Quality.Option("m4a", Quality.label("m4a") + Quality.sizeText(bestAudio)))
+        }
+        return Quality.Available(info.title ?: "", options)
     }
 
     private fun friendlyError(raw: String): String {

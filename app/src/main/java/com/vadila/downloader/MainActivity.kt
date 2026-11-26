@@ -3,101 +3,97 @@ package com.vadila.downloader
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.Typeface
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
-import android.util.TypedValue
 import android.view.Gravity
-import android.view.Menu
-import android.view.MenuItem
 import android.view.View
-import android.view.ViewGroup
-import android.widget.BaseAdapter
-import android.widget.Button
-import android.widget.EditText
+import android.view.inputmethod.InputMethodManager
+import android.webkit.WebChromeClient
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
 
-    private lateinit var input: EditText
-    private lateinit var summary: TextView
-    private lateinit var empty: TextView
-    private lateinit var adapter: TaskAdapter
-    private val handler = Handler(Looper.getMainLooper())
+    lateinit var downloads: DownloadsPage
+    lateinit var browser: BrowserPage
+    private lateinit var settings: SettingsPage
+    private lateinit var pages: FrameLayout
+    private lateinit var fullscreen: FrameLayout
+    private lateinit var title: TextView
+    private lateinit var subtitle: TextView
+    private val navIcons = ArrayList<ImageView>()
+    private val navLabels = ArrayList<TextView>()
+    private var customCallback: WebChromeClient.CustomViewCallback? = null
+    var current = 0
+        private set
 
-    private val refresh = object : Runnable {
+    private val handler = Handler(Looper.getMainLooper())
+    private val tick = object : Runnable {
         override fun run() {
-            adapter.refresh()
-            val list = adapter.items
-            val running = list.count { it.status == Status.RUNNING }
-            val queued = list.count { it.status == Status.QUEUED }
-            summary.text = "السرعة الكلية: ${Engine.fmtBytes(Engine.totalSpeed())}/ث • يعمل: $running • في الانتظار: $queued"
-            empty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
+            onTick()
             handler.postDelayed(this, 800)
         }
     }
 
-    private fun dp(v: Int): Int =
-        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
+    fun dp(v: Int) = Ui.dp(this, v)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Engine.init(this)
-        window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
+        Ui.apply(this)
+        val p = Ui.p
 
-        val pad = dp(12)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
+        val outer = FrameLayout(this).apply {
+            setBackgroundColor(p.bg)
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
+        val main = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        input = EditText(this).apply {
-            hint = "ضع رابط فيديو أو ملف أو صفحة (كل رابط في سطر)"
-            minLines = 2
-            maxLines = 5
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
-            gravity = Gravity.TOP or Gravity.START
-            textDirection = View.TEXT_DIRECTION_LTR
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(p.surface)
+            setPadding(dp(18), dp(12), dp(18), dp(10))
         }
-        root.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        title = Ui.text(this, 21f, p.text, bold = true)
+        subtitle = Ui.text(this, 13f, p.sub)
+        top.addView(title)
+        top.addView(subtitle)
+        main.addView(top, Ui.lp(Ui.MATCH, Ui.WRAP))
 
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(button("تنزيل") { addFromInput() }, weight())
-        row.addView(button("لصق") { paste() }, weight())
-        row.addView(button("الإعدادات") { showSettings() }, weight())
-        root.addView(row)
+        pages = FrameLayout(this)
+        main.addView(pages, Ui.lp(Ui.MATCH, 0, 1f))
+        main.addView(View(this).apply { setBackgroundColor(p.divider) }, Ui.lp(Ui.MATCH, dp(1)))
+        main.addView(buildNav(), Ui.lp(Ui.MATCH, dp(66)))
+        outer.addView(main, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
 
-        summary = TextView(this).apply {
-            setPadding(0, dp(8), 0, dp(8))
-            setTypeface(typeface, Typeface.BOLD)
+        fullscreen = FrameLayout(this).apply {
+            setBackgroundColor(Color.BLACK)
+            visibility = View.GONE
         }
-        root.addView(summary)
+        outer.addView(fullscreen, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
+        setContentView(outer)
 
-        empty = TextView(this).apply {
-            text = "لا توجد تنزيلات بعد.\nالصق رابط فيديو من يوتيوب أو تيك توك أو فيسبوك أو إنستغرام أو X، أو رابط أي ملف، ثم اضغط تنزيل.\nويمكنك مشاركة الرابط إلى هذا التطبيق من أي تطبيق آخر."
-            gravity = Gravity.CENTER
-            setPadding(dp(8), dp(32), dp(8), dp(8))
-        }
-        root.addView(empty)
+        downloads = DownloadsPage(this)
+        browser = BrowserPage(this)
+        settings = SettingsPage(this)
+        pages.addView(downloads.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
+        pages.addView(browser.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
+        pages.addView(settings.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
 
-        val listView = ListView(this).apply { dividerHeight = dp(1) }
-        adapter = TaskAdapter()
-        listView.adapter = adapter
-        root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-
-        setContentView(root)
+        savedInstanceState?.getString("browserUrl")?.let { browser.restore(it) }
+        show(savedInstanceState?.getInt("page") ?: 0)
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -107,49 +103,141 @@ class MainActivity : Activity() {
         handleShare(intent)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt("page", current)
+        browser.currentUrl()?.let { outState.putString("browserUrl", it) }
+    }
+
+    private fun buildNav(): View {
+        val p = Ui.p
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(p.surface)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        val items = listOf(
+            Triple("التنزيلات", R.drawable.ic_download, 0),
+            Triple("المتصفح", R.drawable.ic_globe, 1),
+            Triple("الإعدادات", R.drawable.ic_tune, 2),
+        )
+        for ((label, icon, idx) in items) {
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                background = Ui.pressable(this@MainActivity, Color.TRANSPARENT, 16)
+                setOnClickListener { show(idx) }
+            }
+            val iv = ImageView(this).apply {
+                setImageResource(icon)
+                setPadding(dp(18), dp(4), dp(18), dp(4))
+            }
+            val tv = Ui.text(this, 12f, p.sub).apply { text = label }
+            item.addView(iv, Ui.lp(Ui.WRAP, dp(32)))
+            item.addView(tv)
+            bar.addView(item, Ui.lp(0, Ui.MATCH, 1f))
+            navIcons.add(iv)
+            navLabels.add(tv)
+        }
+        return bar
+    }
+
+    fun show(i: Int) {
+        val p = Ui.p
+        current = i
+        downloads.view.visibility = if (i == 0) View.VISIBLE else View.GONE
+        browser.view.visibility = if (i == 1) View.VISIBLE else View.GONE
+        settings.view.visibility = if (i == 2) View.VISIBLE else View.GONE
+        for (k in navIcons.indices) {
+            val sel = k == i
+            navIcons[k].imageTintList = ColorStateList.valueOf(if (sel) p.accent else p.sub)
+            navIcons[k].background = if (sel) Ui.rounded(this, p.accentSoft, 16) else null
+            navLabels[k].setTextColor(if (sel) p.accent else p.sub)
+            navLabels[k].setTypeface(null, if (sel) Typeface.BOLD else Typeface.NORMAL)
+        }
+        title.text = when (i) {
+            0 -> "مدير التنزيلات"
+            1 -> "المتصفح"
+            else -> "الإعدادات"
+        }
+        when (i) {
+            1 -> browser.onShown()
+            2 -> settings.rebuild()
+        }
+        hideKeyboard()
+        onTick()
+    }
+
+    private fun onTick() {
+        val list = Engine.snapshot()
+        val running = list.count { it.status == Status.RUNNING }
+        val queued = list.count { it.status == Status.QUEUED }
+        subtitle.text = if (running + queued == 0) "لا توجد تنزيلات جارية"
+        else "يعمل $running • في الانتظار $queued • ${Engine.fmtBytes(Engine.totalSpeed())}/ث"
+        if (current == 0) downloads.refresh(list)
+        browser.tick()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        browser.web.onResume()
+        handler.post(tick)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(tick)
+        browser.web.onPause()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        browser.web.destroy()
+        super.onDestroy()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShare(intent)
     }
 
-    override fun onResume() {
-        super.onResume()
-        handler.post(refresh)
-    }
-
-    override fun onPause() {
-        handler.removeCallbacks(refresh)
-        super.onPause()
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        menu.add(0, 1, 0, "استئناف الكل")
-        menu.add(0, 2, 1, "إيقاف الكل")
-        menu.add(0, 3, 2, "مسح المكتملة من القائمة")
-        menu.add(0, 4, 3, "تحديث محرك التنزيل")
-        return true
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        when (item.itemId) {
-            1 -> Engine.resumeAll()
-            2 -> Engine.pauseAll()
-            3 -> Engine.clearFinished()
-            4 -> {
-                toast("جارٍ تحديث محرك التنزيل…")
-                Thread {
-                    val msg = Engine.updateExtractor()
-                    runOnUiThread { toast(msg) }
-                }.start()
-            }
-            else -> return super.onOptionsItemSelected(item)
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        when {
+            fullscreen.visibility == View.VISIBLE -> exitFullscreen()
+            current == 1 && browser.web.canGoBack() -> browser.web.goBack()
+            current != 0 -> show(0)
+            else -> @Suppress("DEPRECATION") super.onBackPressed()
         }
-        return true
     }
 
-    // ------------------------------------------------------------------ input
+    // ------------------------------------------------------------ fullscreen video
 
-    private fun extractUrls(text: String): List<String> =
+    fun enterFullscreen(v: View?, cb: WebChromeClient.CustomViewCallback?) {
+        if (v == null) return
+        if (fullscreen.visibility == View.VISIBLE) exitFullscreen()
+        fullscreen.addView(v, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
+        fullscreen.visibility = View.VISIBLE
+        customCallback = cb
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN
+            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
+    }
+
+    fun exitFullscreen() {
+        fullscreen.removeAllViews()
+        fullscreen.visibility = View.GONE
+        customCallback?.onCustomViewHidden()
+        customCallback = null
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = 0
+        Ui.apply(this)
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+
+    // ------------------------------------------------------------ starting downloads
+
+    fun extractUrls(text: String): List<String> =
         Regex("https?://[^\\s\"'<>]+", RegexOption.IGNORE_CASE).findAll(text)
             .map { it.value.trimEnd('.', ',', ')', ']', '؛', '،') }
             .distinct().toList()
@@ -159,213 +247,98 @@ class MainActivity : Activity() {
             val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
             val urls = extractUrls(text)
             if (urls.isNotEmpty()) {
-                input.setText(urls.joinToString("\n"))
-                toast("اضغط تنزيل لبدء التنزيل")
+                show(0)
+                requestDownload(urls)
             }
             i.action = null
         }
     }
 
-    private fun addFromInput() {
-        val urls = extractUrls(input.text.toString())
-        if (urls.isEmpty()) { toast("لم أجد رابطًا صالحًا يبدأ بـ http أو https"); return }
-        Engine.add(urls)
-        input.setText("")
-        toast("أُضيف ${urls.size} تنزيل")
-        adapter.refresh()
+    private val fileExt = Regex(
+        "\\.(mp4|m4v|webm|mkv|mov|3gp|avi|mp3|m4a|aac|ogg|opus|wav|flac|jpg|jpeg|png|gif|webp|zip|rar|7z|apk|pdf|docx?|xlsx?|pptx?|txt|iso|exe|tar|gz)$",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun looksLikeFile(url: String): Boolean =
+        fileExt.containsMatchIn(url.substringBefore('#').substringBefore('?'))
+
+    /** Adds downloads, asking for the quality first when that's enabled. */
+    fun requestDownload(urls: List<String>, referer: String? = null, userAgent: String? = null) {
+        if (urls.isEmpty()) return
+        val enqueue = { q: String ->
+            if (referer == null && userAgent == null) Engine.add(urls, q)
+            else urls.forEach { Engine.addFromBrowser(it, q, null, null, userAgent, referer, null) }
+            toast(if (urls.size == 1) "بدأ التنزيل" else "أُضيف ${urls.size} تنزيلات")
+            onTick()
+        }
+        if (!Engine.askQuality || (urls.size == 1 && looksLikeFile(urls[0]))) {
+            enqueue(Engine.defaultQuality); return
+        }
+        if (urls.size > 1) { pickFixedQuality("الجودة لكل الروابط", enqueue); return }
+        pickRealQuality(urls[0], enqueue)
     }
 
-    private fun paste() {
-        val cm = getSystemService(ClipboardManager::class.java)
-        val text = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
-        if (text.isNullOrBlank()) { toast("الحافظة فارغة"); return }
-        val cur = input.text.toString()
-        input.setText(if (cur.isBlank()) text else cur.trimEnd() + "\n" + text)
-        input.setSelection(input.text.length)
-    }
-
-    private fun showSettings() {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-        }
-        fun field(label: String, value: Int): EditText {
-            box.addView(TextView(this).apply { text = label; setPadding(0, dp(10), 0, 0) })
-            val e = EditText(this).apply {
-                inputType = InputType.TYPE_CLASS_NUMBER
-                setText(value.toString())
-            }
-            box.addView(e)
-            return e
-        }
-        val conn = field("عدد الاتصالات لكل ملف (1 – 16)", Engine.connections)
-        val conc = field("عدد الملفات التي تُنزَّل معًا (1 – 5)", Engine.maxConcurrent)
-        val limit = field("حد السرعة بالكيلوبايت/ث (0 = بلا حد)", Engine.speedLimitKb)
+    fun pickFixedQuality(heading: String, onPicked: (String) -> Unit) {
+        val keys = Quality.fixed.keys.toList()
         AlertDialog.Builder(this)
-            .setTitle("الإعدادات")
-            .setView(box)
-            .setPositiveButton("حفظ") { _, _ ->
-                conn.text.toString().toIntOrNull()?.let { Engine.connections = it }
-                conc.text.toString().toIntOrNull()?.let { Engine.maxConcurrent = it }
-                limit.text.toString().toIntOrNull()?.let { Engine.speedLimitKb = it }
-                toast("حُفظت الإعدادات (عدد الاتصالات يطبَّق على التنزيلات الجديدة)")
-            }
+            .setTitle(heading)
+            .setItems(keys.map { Quality.label(it) }.toTypedArray()) { _, w -> onPicked(keys[w]) }
             .setNegativeButton("إلغاء", null)
             .show()
     }
 
-    // ------------------------------------------------------------------ list
-
-    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { onClick() }
-    }
-
-    private fun weight() = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-
-    private class Holder(
-        val name: TextView,
-        val info: TextView,
-        val bar: ProgressBar,
-        val action: Button,
-        val open: Button,
-        val delete: Button,
-    )
-
-    inner class TaskAdapter : BaseAdapter() {
-        var items: List<Task> = emptyList()
-
-        fun refresh() {
-            items = Engine.snapshot()
-            notifyDataSetChanged()
+    private fun pickRealQuality(url: String, onPicked: (String) -> Unit) {
+        var cancelled = false
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(24), dp(20), dp(24), dp(12))
         }
-
-        override fun getCount() = items.size
-        override fun getItem(position: Int): Any = items[position]
-        override fun getItemId(position: Int) = items[position].id
-        override fun hasStableIds() = true
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val view: View
-            val h: Holder
-            if (convertView == null) {
-                val ctx = this@MainActivity
-                val box = LinearLayout(ctx).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(4), dp(10), dp(4), dp(10))
-                    descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
-                }
-                val name = TextView(ctx).apply {
-                    setTypeface(typeface, Typeface.BOLD)
-                    maxLines = 2
-                }
-                val bar = ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
-                val info = TextView(ctx).apply { textSize = 13f }
-                val buttons = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-                val action = Button(ctx).apply { isAllCaps = false }
-                val open = Button(ctx).apply { isAllCaps = false; text = "فتح" }
-                val delete = Button(ctx).apply { isAllCaps = false; text = "حذف" }
-                buttons.addView(action, weight())
-                buttons.addView(open, weight())
-                buttons.addView(delete, weight())
-                box.addView(name)
-                box.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-                box.addView(info)
-                box.addView(buttons)
-                h = Holder(name, info, bar, action, open, delete)
-                box.tag = h
-                view = box
-            } else {
-                view = convertView
-                h = convertView.tag as Holder
+        box.addView(ProgressBar(this).apply {
+            indeterminateTintList = ColorStateList.valueOf(Ui.p.accent)
+        }, Ui.lp(dp(36), dp(36)))
+        box.addView(Ui.text(this, 15f, Ui.p.text).apply {
+            text = "جارٍ جلب الجودات المتاحة…\n(أول مرة قد تستغرق بضع ثوانٍ)"
+            setPadding(dp(16), 0, dp(16), 0)
+        })
+        val loading = AlertDialog.Builder(this)
+            .setView(box)
+            .setNegativeButton("إلغاء") { _, _ -> cancelled = true }
+            .setNeutralButton("جودة يدويًا") { _, _ ->
+                cancelled = true
+                pickFixedQuality("اختر الجودة", onPicked)
             }
-            bind(h, items[position])
-            return view
-        }
-
-        private fun bindMedia(h: Holder, t: Task) {
-            val pct = t.progressPct
-            if (t.status == Status.RUNNING && pct < 0) h.bar.isIndeterminate = true
-            else { h.bar.isIndeterminate = false; h.bar.progress = (pct.coerceIn(0f, 100f) * 10).toInt() }
-            val pctText = if (pct >= 0) "${pct.toInt()}%" else ""
-            val size = if (t.totalBytes > 0) " • ${Engine.fmtBytes(t.totalBytes)}" else ""
-            val eta = if (t.eta > 0) " • متبقٍّ ${t.eta / 60}:${"%02d".format(t.eta % 60)}" else ""
-            h.info.text = when (t.status) {
-                Status.RUNNING -> if (t.pauseRequested) "جارٍ الإيقاف…" else
-                    listOf("يُنزَّل (صفحة/فيديو)", t.statusLine, pctText).filter { it.isNotBlank() }.joinToString(" • ") +
-                        "$size • ${Engine.fmtBytes(t.speed)}/ث$eta"
-                Status.QUEUED -> "في الانتظار"
-                Status.PAUSED -> "متوقف مؤقتًا" + (if (pctText.isNotEmpty()) " • $pctText" else "")
-                Status.DONE -> "اكتمل • ${Engine.fmtBytes(t.totalBytes)} • في مجلد Download/Downloader"
-                Status.FAILED -> "فشل: ${t.error ?: "خطأ غير معروف"}"
-            }
-        }
-
-        private fun bind(h: Holder, t: Task) {
-            h.name.text = t.fileName.ifBlank { t.url }
-            bindButtons(h, t)
-            if (t.media) { bindMedia(h, t); return }
-            val done = t.downloaded()
-            val total = t.totalBytes
-            when {
-                t.status == Status.DONE -> { h.bar.isIndeterminate = false; h.bar.progress = 1000 }
-                total > 0 -> { h.bar.isIndeterminate = false; h.bar.progress = (done * 1000 / total).toInt().coerceIn(0, 1000) }
-                t.status == Status.RUNNING -> h.bar.isIndeterminate = true
-                else -> { h.bar.isIndeterminate = false; h.bar.progress = 0 }
-            }
-            val size = if (total > 0) "${Engine.fmtBytes(done)} / ${Engine.fmtBytes(total)}" else Engine.fmtBytes(done)
-            val pct = if (total > 0) " (${done * 100 / total}%)" else ""
-            h.info.text = when (t.status) {
-                Status.RUNNING -> if (t.pauseRequested) "جارٍ الإيقاف…" else
-                    "يُنزَّل • $size$pct • ${Engine.fmtBytes(t.speed)}/ث • ${t.segments.count { !it.complete() }} اتصال"
-                Status.QUEUED -> "في الانتظار"
-                Status.PAUSED -> "متوقف مؤقتًا • $size$pct"
-                Status.DONE -> "اكتمل • ${Engine.fmtBytes(total)} • في مجلد Download/Downloader"
-                Status.FAILED -> "فشل: ${t.error ?: "خطأ غير معروف"}"
-            }
-        }
-
-        private fun bindButtons(h: Holder, t: Task) {
-            h.action.visibility = if (t.status == Status.DONE) View.GONE else View.VISIBLE
-            h.action.text = when (t.status) {
-                Status.RUNNING, Status.QUEUED -> "إيقاف"
-                Status.FAILED -> "إعادة المحاولة"
-                else -> "استئناف"
-            }
-            h.action.setOnClickListener {
-                if (t.status == Status.RUNNING || t.status == Status.QUEUED) Engine.pause(t.id) else Engine.resume(t.id)
-                refresh()
-            }
-            h.open.visibility = if (t.status == Status.DONE && t.savedUri != null) View.VISIBLE else View.GONE
-            h.open.setOnClickListener { openFile(t) }
-            h.delete.setOnClickListener { confirmDelete(t) }
-        }
-    }
-
-    private fun openFile(t: Task) {
-        val uri = t.savedUri ?: return
-        try {
-            val i = Intent(Intent.ACTION_VIEW)
-                .setDataAndType(Uri.parse(uri), t.mime.ifBlank { "*/*" })
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            startActivity(Intent.createChooser(i, "فتح باستخدام"))
-        } catch (e: Exception) {
-            toast("لا يوجد تطبيق لفتح هذا الملف")
-        }
-    }
-
-    private fun confirmDelete(t: Task) {
-        val msg = if (t.status == Status.DONE)
-            "إزالة \"${t.fileName}\" من القائمة؟ (يبقى الملف في مجلد التنزيلات)"
-        else "إلغاء تنزيل \"${t.fileName}\" وحذف الجزء المنزَّل؟"
-        AlertDialog.Builder(this)
-            .setMessage(msg)
-            .setPositiveButton("نعم") { _, _ -> Engine.remove(t.id); adapter.refresh() }
-            .setNegativeButton("لا", null)
+            .setOnCancelListener { cancelled = true }
             .show()
+
+        Thread {
+            val result = runCatching { Media.fetchQualities(this, url) }
+            runOnUiThread {
+                if (cancelled || isFinishing) return@runOnUiThread
+                loading.dismiss()
+                result.onSuccess { av ->
+                    val opts = av.options
+                    AlertDialog.Builder(this)
+                        .setTitle(av.title.ifBlank { "اختر الجودة" })
+                        .setItems(opts.map { it.label }.toTypedArray()) { _, w -> onPicked(opts[w].key) }
+                        .setNegativeButton("إلغاء", null)
+                        .show()
+                }.onFailure { e ->
+                    AlertDialog.Builder(this)
+                        .setTitle("تعذّر جلب الجودات")
+                        .setMessage((e.message ?: "") + "\n\nإن كان رابط ملف مباشر فيمكنك تنزيله على أي حال.")
+                        .setPositiveButton("تنزيل على أي حال") { _, _ -> onPicked(Engine.defaultQuality) }
+                        .setNegativeButton("إلغاء", null)
+                        .show()
+                }
+            }
+        }.start()
     }
 
-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+    fun hideKeyboard() {
+        val imm = getSystemService(InputMethodManager::class.java)
+        currentFocus?.let { imm.hideSoftInputFromWindow(it.windowToken, 0) }
+    }
+
+    fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 }

@@ -53,6 +53,11 @@ class Task(val id: Long, val url: String) {
     @Volatile var progressPct = -1f
     @Volatile var eta = -1L
     @Volatile var statusLine = ""
+    @Volatile var quality = "best"
+    /** Extra request headers, used for files started from the in-app browser. */
+    @Volatile var userAgent = ""
+    @Volatile var referer = ""
+    @Volatile var cookie = ""
 
     fun downloaded(): Long = segments.sumOf { it.done.get() }
 
@@ -60,6 +65,7 @@ class Task(val id: Long, val url: String) {
         put("id", id); put("url", url); put("finalUrl", finalUrl)
         put("name", fileName); put("mime", mime); put("total", totalBytes)
         put("ranges", supportsRanges); put("status", status.name); put("media", media)
+        put("quality", quality); put("ua", userAgent); put("ref", referer); put("cookie", cookie)
         put("error", error ?: ""); put("uri", savedUri ?: "")
         val arr = JSONArray()
         for (s in segments) arr.put(JSONObject().apply {
@@ -77,6 +83,10 @@ class Task(val id: Long, val url: String) {
             t.totalBytes = o.optLong("total", -1)
             t.supportsRanges = o.optBoolean("ranges")
             t.media = o.optBoolean("media")
+            t.quality = o.optString("quality", "best").ifEmpty { "best" }
+            t.userAgent = o.optString("ua", "")
+            t.referer = o.optString("ref", "")
+            t.cookie = o.optString("cookie", "")
             t.status = runCatching { Status.valueOf(o.optString("status")) }.getOrDefault(Status.PAUSED)
             t.error = o.optString("error").ifEmpty { null }
             t.savedUri = o.optString("uri").ifEmpty { null }
@@ -186,13 +196,39 @@ object Engine {
         }
     }
 
+    var defaultQuality: String
+        get() = prefs.getString("quality", "best") ?: "best"
+        set(v) { prefs.edit().putString("quality", v).apply() }
+    var askQuality: Boolean
+        get() = prefs.getBoolean("askQuality", true)
+        set(v) { prefs.edit().putBoolean("askQuality", v).apply() }
+
     @Synchronized
-    fun add(urls: List<String>) {
+    fun add(urls: List<String>, quality: String = defaultQuality) {
         for (u in urls) {
             val t = Task(nextId++, u)
             t.fileName = guessNameFromUrl(u)
+            t.quality = quality
             tasks.add(0, t)
         }
+        schedule()
+    }
+
+    /** A single download started from the in-app browser (keeps the page's headers). */
+    @Synchronized
+    fun addFromBrowser(
+        url: String, quality: String, name: String?, mime: String?,
+        userAgent: String?, referer: String?, cookie: String?, forceMedia: Boolean = false,
+    ) {
+        val t = Task(nextId++, url)
+        t.fileName = if (!name.isNullOrBlank()) clean(name) else guessNameFromUrl(url)
+        t.mime = mime ?: ""
+        t.quality = quality
+        t.userAgent = userAgent ?: ""
+        t.referer = referer ?: ""
+        t.cookie = cookie ?: ""
+        t.media = forceMedia
+        tasks.add(0, t)
         schedule()
     }
 
@@ -273,20 +309,22 @@ object Engine {
 
     // ---------------------------------------------------------------- download
 
-    private fun open(url: String, follow: Boolean = true): HttpURLConnection =
+    private fun open(url: String, t: Task, follow: Boolean = true): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = follow
             connectTimeout = 20_000
             readTimeout = 30_000
-            setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) Downloader/1.0")
+            setRequestProperty("User-Agent", t.userAgent.ifBlank { "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36" })
             setRequestProperty("Accept-Encoding", "identity")
+            if (t.referer.isNotBlank()) setRequestProperty("Referer", t.referer)
+            if (t.cookie.isNotBlank()) setRequestProperty("Cookie", t.cookie)
         }
 
     /** Follows redirects manually (also http <-> https) and returns the final connection. */
     private fun resolve(t: Task): HttpURLConnection {
         var url = t.url
         repeat(12) {
-            val c = open(url, follow = false)
+            val c = open(url, t, follow = false)
             c.setRequestProperty("Range", "bytes=0-0")
             val code = c.responseCode
             if (code in 300..399) {
@@ -320,7 +358,8 @@ object Engine {
             t.supportsRanges = false
             t.totalBytes = conn.contentLengthLong
         }
-        t.fileName = nameFrom(conn.getHeaderField("Content-Disposition"), url)
+        val cd = conn.getHeaderField("Content-Disposition")
+        if (cd != null || t.fileName.isBlank() || t.fileName == guessNameFromUrl(t.url)) t.fileName = nameFrom(cd, url)
         val ext = t.fileName.substringAfterLast('.', "").lowercase()
         t.mime = type.substringBefore(';').trim().takeIf { it.isNotEmpty() && it != "application/octet-stream" }
             ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
@@ -446,7 +485,7 @@ object Engine {
                 RandomAccessFile(temp, "rw").use { raf ->
                     if (!t.supportsRanges) { seg.done.set(0); raf.setLength(0) }
                     val from = seg.start + seg.done.get()
-                    conn = open(t.finalUrl).also { c ->
+                    conn = open(t.finalUrl, t).also { c ->
                         if (t.supportsRanges) {
                             c.setRequestProperty("Range", if (seg.end >= 0) "bytes=$from-${seg.end}" else "bytes=$from-")
                         }
@@ -512,7 +551,7 @@ object Engine {
 
     // ---------------------------------------------------------------- helpers
 
-    private fun clean(s: String): String =
+    fun clean(s: String): String =
         s.replace(Regex("[\\\\/:*?\"<>|\\x00-\\x1f]"), "_").trim().take(150).ifBlank { "file" }
 
     fun guessNameFromUrl(url: String): String {
