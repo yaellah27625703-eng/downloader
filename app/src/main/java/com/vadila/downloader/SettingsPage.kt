@@ -1,6 +1,10 @@
 package com.vadila.downloader
 
 import android.app.AlertDialog
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import android.content.res.ColorStateList
 import android.text.InputType
 import android.view.Gravity
@@ -83,10 +87,43 @@ class SettingsPage(private val a: MainActivity) {
         card.addView(sb, Ui.lp(Ui.MATCH, dp(40)))
     }
 
+    private fun switchRow(card: LinearLayout, title: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+        val p = Ui.p
+        val r = LinearLayout(a).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+        }
+        r.addView(Ui.text(a, 15f, p.text).apply { text = title }, Ui.lp(0, Ui.WRAP, 1f))
+        val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+        r.addView(Switch(a).apply {
+            isChecked = checked
+            thumbTintList = ColorStateList(states, intArrayOf(p.accent, p.sub))
+            trackTintList = ColorStateList(states, intArrayOf(p.accentSoft, p.divider))
+            setOnCheckedChangeListener { _, c -> onChange(c) }
+        })
+        card.addView(r)
+    }
+
+    private fun hint(card: LinearLayout, text: String) {
+        card.addView(Ui.text(a, 12.5f, Ui.p.sub).apply {
+            this.text = text
+            setPadding(dp(4), 0, dp(4), dp(6))
+        })
+    }
+
     private fun divider(card: LinearLayout) {
         card.addView(View(a).apply { setBackgroundColor(Ui.p.divider) }, Ui.lp(Ui.MATCH, 1).apply {
             topMargin = dp(4); bottomMargin = dp(4)
         })
+    }
+
+    fun requestBattery() {
+        runCatching {
+            a.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + a.packageName)))
+        }.onFailure {
+            runCatching { a.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+        }
     }
 
     fun rebuild() {
@@ -150,7 +187,8 @@ class SettingsPage(private val a: MainActivity) {
 
         // Speed
         val s = section("السرعة")
-        slider(s, "عدد الاتصالات لكل ملف", 1, 16, Engine.connections) { Engine.connections = it }
+        slider(s, "عدد الاتصالات لكل ملف", 1, 32, Engine.connections) { Engine.connections = it }
+        hint(s, "16 أو أكثر = أقصى سرعة. الاتصالات الحرة تتقاسم الأجزاء المتبقية تلقائيًا حتى آخر بايت، والاتصال البطيء يُستبدل بآخر جديد.")
         slider(s, "عدد الملفات التي تُنزَّل معًا", 1, 5, Engine.maxConcurrent) { Engine.maxConcurrent = it }
         divider(s)
         lateinit var limitValue: TextView
@@ -175,6 +213,30 @@ class SettingsPage(private val a: MainActivity) {
                 .setNegativeButton("إلغاء", null)
                 .show()
         }
+
+        switchRow(s, "مسرّع الفيديو (aria2 – 16 اتصالًا)", Engine.useAria2) { Engine.useAria2 = it }
+        hint(s, "يسرّع تنزيل الفيديو بعدة اتصالات. إن فشل مع موقع ما يعيد المحاولة تلقائيًا بالمحرك العادي.")
+
+        // Background
+        val bg = section("العمل في الخلفية")
+        val pm = a.getSystemService(PowerManager::class.java)
+        val unrestricted = pm.isIgnoringBatteryOptimizations(a.packageName)
+        row(bg, "التشغيل دون قيود البطارية", if (unrestricted) "مفعّل ✓" else "اضغط للتفعيل") {
+            requestBattery()
+        }
+        hint(bg, "يمنع الهاتف من إيقاف التنزيل عند الخروج من التطبيق أو إطفاء الشاشة.")
+        divider(bg)
+        val overlayOk = Settings.canDrawOverlays(a)
+        switchRow(bg, "زر عائم فوق التطبيقات", Engine.bubble && overlayOk) { on ->
+            Engine.bubble = on
+            if (on && !Settings.canDrawOverlays(a)) {
+                a.toast("فعّل «السماح بالظهور فوق التطبيقات» ثم ارجع")
+                runCatching {
+                    a.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + a.packageName)))
+                }
+            } else if (on) DownloadService.start(a)
+        }
+        hint(bg, "انسخ رابط فيديو من أي تطبيق (تيك توك، يوتيوب…) ثم اضغط الزر العائم فيبدأ التنزيل بالجودة الافتراضية. اسحبه لتحريكه، واضغط مطوّلًا لفتح التطبيق.")
 
         // Engine
         val e = section("محرك تنزيل الفيديو")
@@ -201,7 +263,7 @@ class SettingsPage(private val a: MainActivity) {
         // About
         val about = section("حول")
         about.addView(Ui.text(a, 14f, p.text).apply {
-            text = "مدير التنزيلات – الإصدار 3.0\nتُحفظ الملفات في مجلد Download/Downloader"
+            text = "مدير التنزيلات – الإصدار 4.0\nتُحفظ الملفات في مجلد Download/Downloader"
             setLineSpacing(0f, 1.3f)
             setPadding(dp(4), dp(4), dp(4), dp(4))
         })

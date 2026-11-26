@@ -11,8 +11,8 @@ android {
         applicationId = "com.vadila.downloader"
         minSdk = 29
         targetSdk = 34
-        versionCode = 3
-        versionName = "3.0"
+        versionCode = 4
+        versionName = "4.0"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -58,4 +58,5 @@ android {
 dependencies {
     implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+    implementation("io.github.junkfood02.youtubedl-android:aria2c:0.17.2")
 }

@@ -182,6 +182,9 @@ class MainActivity : Activity() {
         super.onResume()
         browser.web.onResume()
         handler.post(tick)
+        // Returning from the permission screens: show the floating button / refresh settings.
+        if (DownloadService.bubbleAllowed(this)) DownloadService.start(this)
+        if (current == 2) settings.rebuild()
     }
 
     override fun onPause() {
@@ -270,6 +273,7 @@ class MainActivity : Activity() {
             else urls.forEach { Engine.addFromBrowser(it, q, null, null, userAgent, referer, null) }
             toast(if (urls.size == 1) "بدأ التنزيل" else "أُضيف ${urls.size} تنزيلات")
             onTick()
+            askBatteryOnce()
         }
         if (!Engine.askQuality || (urls.size == 1 && looksLikeFile(urls[0]))) {
             enqueue(Engine.defaultQuality); return
@@ -333,6 +337,20 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
+    }
+
+    /** Asks once to let downloads run in the background without battery restrictions. */
+    private fun askBatteryOnce() {
+        if (Engine.askedBattery) return
+        Engine.askedBattery = true
+        val pm = getSystemService(android.os.PowerManager::class.java)
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        AlertDialog.Builder(this)
+            .setTitle("التنزيل في الخلفية")
+            .setMessage("ليستمر التنزيل بأقصى سرعة حتى بعد الخروج من التطبيق أو إطفاء الشاشة، اسمح للتطبيق بالعمل دون قيود البطارية.")
+            .setPositiveButton("السماح") { _, _ -> settings.requestBattery() }
+            .setNegativeButton("لاحقًا", null)
+            .show()
     }
 
     fun hideKeyboard() {

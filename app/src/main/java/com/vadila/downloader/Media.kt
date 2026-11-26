@@ -1,6 +1,7 @@
 package com.vadila.downloader
 
 import android.content.Context
+import com.yausername.aria2c.Aria2c
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
@@ -13,12 +14,14 @@ import java.io.IOException
  */
 object Media {
     @Volatile private var ready = false
+    @Volatile private var aria2Ready = false
 
     @Synchronized
     fun ensureInit(ctx: Context) {
         if (ready) return
         YoutubeDL.getInstance().init(ctx)
         FFmpeg.getInstance().init(ctx)
+        runCatching { Aria2c.getInstance().init(ctx) }.onSuccess { aria2Ready = true }
         ready = true
     }
 
@@ -38,6 +41,10 @@ object Media {
 
     private val speedRe = Regex("at\\s+~?\\s*([\\d.]+)\\s*([KMG]?i?B)/s")
     private val sizeRe = Regex("of\\s+~?\\s*([\\d.]+)\\s*([KMG]?i?B)")
+    // aria2 readout: [#2089b0 400.0KiB/33.2MiB(1%) CN:16 DL:2.1MiB ETA:4s]
+    private val ariaSpeedRe = Regex("DL:([\\d.]+)([KMG]?i?B)")
+    private val ariaSizeRe = Regex("/([\\d.]+)([KMG]?i?B)\\(")
+    private val cnRe = Regex("CN:(\\d+)")
     private const val DEST = "Destination: "
 
     private fun toBytes(num: String, unit: String): Long {
@@ -57,11 +64,43 @@ object Media {
         ensureInit(ctx)
         dir.mkdirs()
         t.statusLine = "جارٍ قراءة الرابط…"
+        val wantAria = Engine.useAria2 && aria2Ready
+        try {
+            runYtdlp(t, dir, connections, limitBytes, wantAria)
+        } catch (e: YoutubeDL.CanceledException) {
+            throw e
+        } catch (e: Exception) {
+            if (!wantAria || t.stop) throw IOException(friendlyError(e.message ?: ""))
+            // aria2 can fail on some sites: try once more with the built-in downloader.
+            t.statusLine = "إعادة المحاولة بالمحرك الداخلي…"
+            try {
+                runYtdlp(t, dir, connections, limitBytes, false)
+            } catch (e2: YoutubeDL.CanceledException) {
+                throw e2
+            } catch (e2: Exception) {
+                throw IOException(friendlyError(e2.message ?: ""))
+            }
+        }
+        val files = dir.listFiles()?.filter {
+            it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") && !it.name.contains(".part-Frag")
+        }.orEmpty()
+        if (files.isEmpty()) throw IOException("لم يُعثر على ملف بعد التنزيل")
+        return files
+    }
+
+    private fun runYtdlp(t: Task, dir: File, connections: Int, limitBytes: Long, aria: Boolean) {
         val req = YoutubeDLRequest(t.url)
             .addOption("-o", dir.absolutePath + "/%(title).120B [%(id)s].%(ext)s")
-            .addOption("-N", connections.coerceIn(1, 16))
+            .addOption("-N", connections.coerceIn(1, 32))
             .addOption("--no-mtime")
             .addOption("--no-playlist")
+            .addOption("--retries", "30")
+            .addOption("--fragment-retries", "30")
+            .addOption("--retry-sleep", "linear=1::5")
+            .addOption("--socket-timeout", "15")
+            .addOption("--http-chunk-size", "10M")
+        // aria2: 16 parallel connections per video file (yt-dlp passes -x16 -s16 to it).
+        if (aria) req.addOption("--downloader", "libaria2c.so")
         for ((k, v) in Quality.ytdlpOptions(t.quality)) {
             if (v == null) req.addOption(k) else req.addOption(k, v)
         }
@@ -70,30 +109,25 @@ object Media {
         if (t.userAgent.isNotBlank()) req.addOption("--user-agent", t.userAgent)
 
         var parts = 0
-        try {
-            YoutubeDL.getInstance().execute(req, processId(t)) { progress, eta, line ->
-                if (progress >= 0) t.progressPct = progress
-                t.eta = eta
-                val d = line.indexOf(DEST)
-                if (d >= 0) {
-                    parts++
-                    t.fileName = File(line.substring(d + DEST.length).trim()).name
-                    t.statusLine = if (parts > 1) "الجزء $parts" else ""
-                }
-                speedRe.find(line)?.let { m -> t.speed = toBytes(m.groupValues[1], m.groupValues[2]) }
-                sizeRe.find(line)?.let { m -> t.totalBytes = toBytes(m.groupValues[1], m.groupValues[2]) }
-                if (line.startsWith("[Merger]") || line.startsWith("[FixupM")) t.statusLine = "جارٍ دمج الصوت والصورة…"
+        YoutubeDL.getInstance().execute(req, processId(t)) { progress, eta, line ->
+            if (progress >= 0) t.progressPct = progress
+            t.eta = eta
+            val d = line.indexOf(DEST)
+            if (d >= 0) {
+                parts++
+                t.fileName = File(line.substring(d + DEST.length).trim()).name
+                t.statusLine = if (parts > 1) "الجزء $parts" else ""
             }
-        } catch (e: YoutubeDL.CanceledException) {
-            throw e
-        } catch (e: Exception) {
-            throw IOException(friendlyError(e.message ?: ""))
+            (speedRe.find(line) ?: ariaSpeedRe.find(line))?.let { m ->
+                val v = toBytes(m.groupValues[1], m.groupValues[2])
+                t.speed = if (t.speed == 0L) v else (t.speed * 2 + v) / 3
+            }
+            (sizeRe.find(line) ?: ariaSizeRe.find(line))?.let { m -> t.totalBytes = toBytes(m.groupValues[1], m.groupValues[2]) }
+            if (line.contains("CN:")) cnRe.find(line)?.let { t.activeConns = it.groupValues[1].toIntOrNull() ?: 0 }
+            if (line.startsWith("[Merger]") || line.startsWith("[FixupM") || line.startsWith("[ExtractAudio]")) {
+                t.statusLine = "جارٍ المعالجة النهائية…"
+            }
         }
-        val files = dir.listFiles()?.filter {
-            it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") && !it.name.contains(".part-Frag")
-        }.orEmpty()
-        if (files.isEmpty()) throw IOException("لم يُعثر على ملف بعد التنزيل")
-        return files
     }
 
     /** Reads the qualities that really exist for [url] (with approximate sizes). */
@@ -144,6 +178,7 @@ object Media {
                 "هذا المحتوى يتطلب تسجيل الدخول أو أنه خاص"
             "unable to resolve" in low || "network is unreachable" in low || "timed out" in low ->
                 "تعذّر الاتصال بالإنترنت أو بالموقع"
+            "aria2" in low -> "فشل مسرّع aria2 مع هذا الموقع؛ أوقفه من الإعدادات وأعد المحاولة"
             "http error 404" in low -> "الصفحة أو الملف غير موجود (404)"
             else -> err.take(300) + "\n(جرّب: القائمة ⋮ ← تحديث محرك التنزيل)"
         }

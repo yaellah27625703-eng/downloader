@@ -4,6 +4,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Environment
 import android.os.SystemClock
@@ -27,12 +30,22 @@ enum class Status { QUEUED, RUNNING, PAUSED, DONE, FAILED }
 /** Thrown by the direct-file probe when the link must go through the media extractor. */
 class NeedsExtractor : Exception()
 
-class Segment(val start: Long, val end: Long, done: Long) {
+class Segment(val start: Long, end: Long, done: Long) {
+    /** Last byte (inclusive). Shrinks when another connection takes over half of this part. */
+    @Volatile var end: Long = end
     val done = AtomicLong(done)
     @Volatile var finishedUnknown = false
+    @Volatile var active = false
+    fun remaining(): Long = if (end >= 0) end - start - done.get() + 1 else Long.MAX_VALUE
     fun complete(): Boolean =
         if (end >= 0) done.get() >= end - start + 1 else finishedUnknown
 }
+
+/** An HTTP error answer from the server (not a network problem). */
+class HttpError(val code: Int, msg: String) : IOException(msg)
+
+/** Thrown inside a connection to drop it and open a fresh one right away. */
+class Reconnect : Exception()
 
 class Task(val id: Long, val url: String) {
     @Volatile var finalUrl: String = url
@@ -58,6 +71,11 @@ class Task(val id: Long, val url: String) {
     @Volatile var userAgent = ""
     @Volatile var referer = ""
     @Volatile var cookie = ""
+    /** Live number of open connections and the ceiling the server tolerates. */
+    @Volatile var activeConns = 0
+    @Volatile var connCap = 64
+    /** Failed because the internet dropped: resumed automatically when it returns. */
+    @Volatile var netFailed = false
 
     fun downloaded(): Long = segments.sumOf { it.done.get() }
 
@@ -98,7 +116,7 @@ class Task(val id: Long, val url: String) {
             }
             t.segments = list
             // Downloads that were interrupted by the app closing wait for the user.
-            if (t.status == Status.RUNNING || t.status == Status.QUEUED) t.status = Status.PAUSED
+            if (t.status == Status.RUNNING || t.status == Status.QUEUED) t.status = Status.QUEUED
             if (!t.supportsRanges && t.status != Status.DONE) t.segments = emptyList()
             if (t.media && t.status == Status.DONE) t.progressPct = 100f
             return t
@@ -134,8 +152,8 @@ object Engine {
     private var nextId = 1L
 
     var connections: Int
-        get() = prefs.getInt("connections", 8)
-        set(v) { prefs.edit().putInt("connections", v.coerceIn(1, 16)).apply() }
+        get() = prefs.getInt("connections2", 16)
+        set(v) { prefs.edit().putInt("connections2", v.coerceIn(1, 32)).apply() }
     var maxConcurrent: Int
         get() = prefs.getInt("maxConcurrent", 3)
         set(v) { prefs.edit().putInt("maxConcurrent", v.coerceIn(1, 5)).apply(); schedule() }
@@ -159,6 +177,9 @@ object Engine {
             for (i in 0 until arr.length()) tasks.add(Task.fromJson(arr.getJSONObject(i)))
         }
         nextId = (tasks.maxOfOrNull { it.id } ?: 0L) + 1
+        watchNetwork()
+        // Downloads interrupted by the app being closed or killed carry on by themselves.
+        if (tasks.any { it.status == Status.QUEUED }) schedule()
         // Keep the extractor fresh: sites change often, so update yt-dlp every 3 days.
         val last = prefs.getLong("ytdlpUpdated", 0)
         if (System.currentTimeMillis() - last > 3L * 24 * 3600 * 1000) {
@@ -169,6 +190,44 @@ object Engine {
                 }
             }.start()
         }
+    }
+
+    fun networkUp(): Boolean {
+        val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return true
+        val n = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(n) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun watchNetwork() {
+        val cm = ctx.getSystemService(ConnectivityManager::class.java) ?: return
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    resumeNetworkFailed()
+                }
+            })
+        }
+    }
+
+    @Synchronized
+    fun resumeNetworkFailed() {
+        var any = false
+        for (t in tasks) if (t.status == Status.FAILED && t.netFailed) {
+            t.status = Status.QUEUED; t.error = null; t.netFailed = false; any = true
+        }
+        if (any) schedule()
+    }
+
+    /** Waits (without giving up) while there is no internet connection. */
+    private fun waitForNetwork(t: Task) {
+        if (networkUp()) return
+        while (!t.stop && !networkUp()) {
+            t.statusLine = "بانتظار عودة الإنترنت…"
+            t.speed = 0
+            Thread.sleep(1000)
+        }
+        t.statusLine = ""
     }
 
     fun updateExtractor(): String = runCatching {
@@ -199,6 +258,15 @@ object Engine {
     var defaultQuality: String
         get() = prefs.getString("quality", "best") ?: "best"
         set(v) { prefs.edit().putString("quality", v).apply() }
+    var useAria2: Boolean
+        get() = prefs.getBoolean("aria2", true)
+        set(v) { prefs.edit().putBoolean("aria2", v).apply() }
+    var bubble: Boolean
+        get() = prefs.getBoolean("bubble", false)
+        set(v) { prefs.edit().putBoolean("bubble", v).apply() }
+    var askedBattery: Boolean
+        get() = prefs.getBoolean("askedBattery", false)
+        set(v) { prefs.edit().putBoolean("askedBattery", v).apply() }
     var askQuality: Boolean
         get() = prefs.getBoolean("askQuality", true)
         set(v) { prefs.edit().putBoolean("askQuality", v).apply() }
@@ -294,17 +362,15 @@ object Engine {
                 t.pauseRequested = false
                 t.error = null
                 t.speed = 0
-                if (t.media && t.status != Status.DONE) t.statusLine = ""
+                t.connCap = 64
+                t.netFailed = false
+                if (t.status != Status.DONE) t.statusLine = ""
                 active++
                 Thread({ runTask(t) }, "task-${t.id}").start()
             }
         }
         save()
-        if (activeCount() > 0 && !DownloadService.running) {
-            runCatching {
-                ctx.startForegroundService(Intent(ctx, DownloadService::class.java))
-            }
-        }
+        if (activeCount() > 0 && !DownloadService.running) DownloadService.start(ctx)
     }
 
     // ---------------------------------------------------------------- download
@@ -312,8 +378,8 @@ object Engine {
     private fun open(url: String, t: Task, follow: Boolean = true): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = follow
-            connectTimeout = 20_000
-            readTimeout = 30_000
+            connectTimeout = 12_000
+            readTimeout = 15_000
             setRequestProperty("User-Agent", t.userAgent.ifBlank { "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36" })
             setRequestProperty("Accept-Encoding", "identity")
             if (t.referer.isNotBlank()) setRequestProperty("Referer", t.referer)
@@ -364,10 +430,13 @@ object Engine {
         t.mime = type.substringBefore(';').trim().takeIf { it.isNotEmpty() && it != "application/octet-stream" }
             ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
             ?: "application/octet-stream"
-        conn.disconnect()
+        if (conn.responseCode == 206) {
+            // The probe asked for 1 byte: drain it so the connection can be reused (saves a handshake).
+            runCatching { conn.inputStream.use { it.readBytes() } }.onFailure { conn.disconnect() }
+        } else conn.disconnect()
 
         if (t.supportsRanges) {
-            val minPart = 512L * 1024
+            val minPart = 256L * 1024
             val n = min(connections.toLong(), max(1L, t.totalBytes / minPart)).toInt()
             val size = t.totalBytes / n
             t.segments = (0 until n).map { i ->
@@ -387,6 +456,7 @@ object Engine {
         t.segments = emptyList()
         save()
         val dir = mediaDir(t)
+        waitForNetwork(t)
         val files = Media.download(ctx, t, dir, connections, Limiter.bytesPerSec)
         var total = 0L
         for (f in files) {
@@ -428,37 +498,65 @@ object Engine {
                 if (t.supportsRanges && raf.length() != t.totalBytes) raf.setLength(t.totalBytes)
             }
             val failure = AtomicReference<Throwable?>(null)
-            val threads = t.segments.filter { !it.complete() }.map { seg ->
-                Thread({
+            val workers = ArrayList<Thread>()
+            fun spawn(seg: Segment) {
+                seg.active = true
+                val th = Thread({
                     try {
                         runSegment(t, seg, temp)
                     } catch (e: Throwable) {
-                        t.stop = true
-                        failure.compareAndSet(null, e)
+                        if (!t.stop) { failure.compareAndSet(null, e); t.stop = true }
+                    } finally {
+                        seg.active = false
                     }
                     Unit
-                }, "seg-${t.id}").apply { start() }
+                }, "seg-${t.id}")
+                workers.add(th)
+                th.start()
             }
+            for (seg in t.segments) if (!seg.complete()) spawn(seg)
+
             var last = t.downloaded()
             var lastTime = SystemClock.elapsedRealtime()
             var lastSave = lastTime
-            while (threads.any { it.isAlive }) {
-                threads.firstOrNull { it.isAlive }?.join(1000)
+            while (true) {
+                workers.removeAll { !it.isAlive }
+                if (!t.stop && t.supportsRanges) {
+                    // Work stealing: every free connection takes over half of the biggest remaining part,
+                    // so all connections stay busy until the very last byte.
+                    val target = min(connections, t.connCap)
+                    var guard = 0
+                    while (workers.size < target && guard++ < 64) {
+                        val ns = splitLargest(t) ?: break
+                        spawn(ns)
+                    }
+                }
+                t.activeConns = workers.size
+                if (workers.isEmpty()) break
+                Thread.sleep(250)
                 val now = SystemClock.elapsedRealtime()
-                val d = t.downloaded()
-                if (now - lastTime >= 500) {
-                    t.speed = (d - last) * 1000 / max(1L, now - lastTime)
+                if (now - lastTime >= 1000) {
+                    val d = t.downloaded()
+                    val inst = (d - last) * 1000 / max(1L, now - lastTime)
+                    // Smoothed speed for a steady display.
+                    t.speed = if (t.speed == 0L) inst else (t.speed * 2 + inst) / 3
                     last = d; lastTime = now
                 }
                 if (now - lastSave > 3000) { save(); lastSave = now }
+            }
+            t.activeConns = 0
+            if (!t.stop && failure.get() == null && t.segments.any { !it.complete() }) {
+                failure.set(IOException("لم يكتمل التنزيل"))
             }
             t.speed = 0
             when {
                 t.removed -> { temp.delete(); return }
                 t.pauseRequested -> t.status = Status.PAUSED
                 failure.get() != null -> {
+                    val f = failure.get()
                     t.status = Status.FAILED
-                    t.error = failure.get()?.message ?: failure.get()?.javaClass?.simpleName
+                    t.error = f?.message ?: f?.javaClass?.simpleName
+                    t.netFailed = !networkUp() || (f is IOException && f !is HttpError)
                 }
                 else -> {
                     if (t.totalBytes < 0) t.totalBytes = temp.length()
@@ -471,56 +569,115 @@ object Engine {
             t.speed = 0
             if (t.removed) { temp.delete(); if (t.media) mediaDir(t).deleteRecursively(); return }
             if (t.pauseRequested) t.status = Status.PAUSED
-            else { t.status = Status.FAILED; t.error = e.message ?: e.javaClass.simpleName }
+            else {
+                t.status = Status.FAILED
+                t.error = e.message ?: e.javaClass.simpleName
+                t.netFailed = !networkUp()
+            }
         } finally {
             schedule()
         }
     }
 
+    /** Takes over the second half of the largest part still being downloaded. */
+    private fun splitLargest(t: Task): Segment? {
+        synchronized(t) {
+            val victim = t.segments
+                .filter { it.end >= 0 && it.active && !it.complete() }
+                .maxByOrNull { it.remaining() } ?: return null
+            val rem = victim.remaining()
+            if (rem < 2 * STEAL_MIN) return null
+            val mid = victim.start + victim.done.get() + rem / 2
+            val ns = Segment(mid, victim.end, 0)
+            victim.end = mid - 1
+            t.segments = t.segments + ns
+            return ns
+        }
+    }
+
+    private const val STEAL_MIN = 512L * 1024
+    private const val BUF = 256 * 1024
+
     private fun runSegment(t: Task, seg: Segment, temp: File) {
         var attempts = 0
+        val buf = ByteArray(BUF)
         while (!t.stop && !seg.complete()) {
+            waitForNetwork(t)
+            if (t.stop) return
             var conn: HttpURLConnection? = null
+            var reusable = false
             try {
                 RandomAccessFile(temp, "rw").use { raf ->
                     if (!t.supportsRanges) { seg.done.set(0); raf.setLength(0) }
                     val from = seg.start + seg.done.get()
-                    conn = open(t.finalUrl, t).also { c ->
-                        if (t.supportsRanges) {
-                            c.setRequestProperty("Range", if (seg.end >= 0) "bytes=$from-${seg.end}" else "bytes=$from-")
-                        }
+                    val c = open(t.finalUrl, t)
+                    conn = c
+                    if (t.supportsRanges) {
+                        c.setRequestProperty("Range", if (seg.end >= 0) "bytes=$from-${seg.end}" else "bytes=$from-")
                     }
-                    val c = conn!!
                     val code = c.responseCode
-                    if (t.supportsRanges && code != 206) throw IOException("الخادم رفض التنزيل المجزأ ($code)")
-                    if (code !in 200..299) throw IOException("ردّ الخادم بالخطأ $code")
+                    if (code == 429 || code == 503) {
+                        // Server says "too many connections": use fewer from now on.
+                        t.connCap = max(2, min(t.connCap, t.activeConns - 1))
+                        throw IOException("الخادم مشغول ($code)")
+                    }
+                    if (t.supportsRanges && code != 206) throw HttpError(code, "الخادم رفض التنزيل المجزأ ($code)")
+                    if (code !in 200..299) throw HttpError(code, "ردّ الخادم بالخطأ $code")
                     raf.seek(from)
-                    c.inputStream.use { input ->
-                        val buf = ByteArray(64 * 1024)
-                        while (!t.stop) {
-                            val want = if (seg.end >= 0)
-                                min(buf.size.toLong(), seg.end - seg.start - seg.done.get() + 1).toInt()
-                            else buf.size
-                            if (want <= 0) break
-                            val n = input.read(buf, 0, want)
-                            if (n < 0) break
+                    val input = c.inputStream
+                    var overshoot = false
+                    var ended = false
+                    var winBytes = 0L
+                    var winStart = SystemClock.elapsedRealtime()
+                    var slow = 0
+                    while (!t.stop) {
+                        val want = if (seg.end >= 0) min(buf.size.toLong(), seg.remaining()).toInt() else buf.size
+                        if (want <= 0) break
+                        val n0 = input.read(buf, 0, want)
+                        if (n0 < 0) { ended = true; break }
+                        // The part may have been shortened meanwhile: never write past its end.
+                        val n = if (seg.end >= 0) min(n0.toLong(), seg.remaining()).toInt() else n0
+                        if (n > 0) {
                             Limiter.acquire(n)
                             raf.write(buf, 0, n)
                             seg.done.addAndGet(n.toLong())
-                            attempts = 0
+                        }
+                        if (n < n0) { overshoot = true; break }
+                        attempts = 0
+
+                        // Drop a connection that stays far slower than the others and open a fresh one.
+                        winBytes += n
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - winStart >= 4000) {
+                            val mine = winBytes * 1000 / (now - winStart)
+                            val avg = t.speed / max(1, t.activeConns)
+                            slow = if (t.activeConns > 1 && avg > 32 * 1024 && mine < avg / 4 &&
+                                seg.remaining() > 2L * 1024 * 1024 && Limiter.bytesPerSec <= 0
+                            ) slow + 1 else 0
+                            winBytes = 0
+                            winStart = now
+                            if (slow >= 2) throw Reconnect()
                         }
                     }
+                    if (t.stop) return
+                    if (seg.end < 0) {
+                        if (ended) seg.finishedUnknown = true
+                    }
+                    reusable = !overshoot && (ended || seg.complete())
+                    if (reusable) input.close() // return the socket to the keep-alive pool
                 }
                 if (t.stop) return
-                if (seg.end < 0) seg.finishedUnknown = true
-                else if (!seg.complete()) throw IOException("انقطع الاتصال قبل اكتمال الجزء")
+                if (!seg.complete()) throw IOException("انقطع الاتصال قبل اكتمال الجزء")
+            } catch (e: Reconnect) {
+                // open a new connection immediately
             } catch (e: Exception) {
                 if (t.stop) return
                 attempts++
-                if (attempts > 6) throw e
-                Thread.sleep(1500L * attempts)
+                val limit = if (e is HttpError) 6 else 40
+                if (attempts > limit) throw e
+                Thread.sleep(min(400L * attempts, 6000L))
             } finally {
-                conn?.disconnect()
+                if (!reusable) conn?.disconnect()
             }
         }
     }
