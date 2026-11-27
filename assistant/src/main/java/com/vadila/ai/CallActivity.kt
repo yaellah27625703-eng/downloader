@@ -380,7 +380,11 @@ class CallActivity : Activity() {
         val sys = Prefs.system() + "\n\nأنت في مكالمة صوتية: أجب بجملتين أو ثلاث جمل قصيرة طبيعية بلغة المتصل، دون Markdown أو رموز."
         Thread {
             val reply = try {
-                Router.run(Router.autoChain(), Req(history.takeLast(16), sys), c, {}, { _, _ -> }).text
+                // the same thinking layer as the chat: it can look things up and calculate during the call
+                val plan = Agent.plan(text, false, false).let { Agent.Plan(it.task, false, it.preSearch) }
+                val raw = Agent.run(Router.autoChain(), Req(history.takeLast(16), sys), plan, c, { s -> ui.post { if (!ended) stateTv.text = s } }) { _, _ -> }.text
+                Smart.memories(raw).forEach { Memory.add(it) }
+                Smart.visible(raw)
             } catch (e: Exception) {
                 if (c.stopped) return@Thread
                 "عذرًا، " + (if (e is ApiError) Errors.friendly(e) else "حدث خطأ.")

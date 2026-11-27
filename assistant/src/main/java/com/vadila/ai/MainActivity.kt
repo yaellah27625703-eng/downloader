@@ -66,6 +66,7 @@ class MainActivity : Activity() {
     private var brain = "auto"
     private var searchOn = false
     private var imageMode = false
+    private var thinkOn = false
     private var running: Cancel? = null
     private var dictation: Dictation? = null
     private var recorder: Recorder? = null
@@ -305,9 +306,18 @@ class MainActivity : Activity() {
             if (searchOn) imageMode = false
             rebuildTools()
         }, Ui.lp(Ui.WRAP, Ui.WRAP).apply { marginEnd = dp(6) })
+        toolRow.addView(Ui.chip(this, "تفكير عميق", thinkOn, R.drawable.ic_sparkle) {
+            thinkOn = !thinkOn
+            if (thinkOn) imageMode = false
+            rebuildTools()
+            if (thinkOn) Ui.toast(this, "سيفكّر بعمق ويستعمل أقوى نموذج متاح (أبطأ قليلًا)")
+        }, Ui.lp(Ui.WRAP, Ui.WRAP).apply { marginEnd = dp(6) })
         toolRow.addView(Ui.chip(this, "رسم صورة", imageMode, R.drawable.ic_brush) {
             imageMode = !imageMode
-            if (imageMode) searchOn = false
+            if (imageMode) {
+                searchOn = false
+                thinkOn = false
+            }
             rebuildTools()
             if (imageMode) input.hint = "صِف الصورة التي تريدها، أو أرفق صورة واكتب التعديل…" else input.hint = "اكتب أو تكلّم…"
         }, Ui.lp(Ui.WRAP, Ui.WRAP).apply { marginEnd = dp(6) })
@@ -328,7 +338,7 @@ class MainActivity : Activity() {
             "device" -> "داخل الهاتف — بلا إنترنت"
             else -> Catalog.pretty(brain.substringAfter(':'))
         }
-        subTv.text = mode + (if (searchOn) " • بحث في الويب" else "") + (if (imageMode) " • رسم" else "")
+        subTv.text = mode + (if (searchOn) " • بحث في الويب" else "") + (if (thinkOn) " • تفكير عميق" else "") + (if (imageMode) " • رسم" else "")
     }
 
     private fun updateSendIcon() {
@@ -892,6 +902,7 @@ class MainActivity : Activity() {
             chat.title = Md.firstLineTitle(text).ifBlank { user.atts.firstOrNull()?.name ?: "محادثة" }
             titleTv.text = chat.title
         }
+        chat.msgs.dropLast(1).lastOrNull { it.role == "assistant" }?.let { prev -> if (prev.suggest.isNotEmpty()) holders[prev.id]?.render(false) }
         addView(user)
         scrollDown(true)
         respond()
@@ -940,7 +951,7 @@ class MainActivity : Activity() {
         val pushUi = Runnable {
             pushScheduled = false
             lastPush = System.currentTimeMillis()
-            reply.text = synchronized(acc) { acc.toString() }
+            reply.text = Smart.visible(synchronized(acc) { acc.toString() })
             h.render(streaming = true)
             scrollDown(false)
         }
@@ -966,15 +977,19 @@ class MainActivity : Activity() {
                     val last = req.turns.last()
                     val links = Web.readLinks(last.text, Prefs.hasKey("gemini"), cancel, st)
                     val req2 = if (links.isEmpty()) req else Req(req.turns.dropLast(1) + Turn(last.role, last.text + links, last.atts), req.system, req.search, req.wantImage)
-                    val res = when {
-                        choice == "council" -> Router.runCouncil(req2, cancel, st, onDelta)
-                        search -> Router.runSearch(Router.chainFor(choice), req2, cancel, st, onDelta)
-                        else -> Router.run(Router.chainFor(choice), req2, cancel, st, onDelta)
+                    val res = if (choice == "council") Router.runCouncil(req2, cancel, st, onDelta) else {
+                        val plan = Agent.plan(last.text, search, thinkOn)
+                        if (plan.think) st("سؤال يحتاج تفكيرًا عميقًا — يختار أقوى نموذج متاح…")
+                        Agent.run(Agent.arrange(Router.chainFor(choice), plan, choice), req2, plan, cancel, st, onDelta)
                     }
                     val imgs = res.images.mapNotNull { (mime, b64) -> saveImage(Net.unb64(b64), mime) }
                     ui.post {
                         ui.removeCallbacks(pushUi)
-                        reply.text = res.text
+                        Smart.memories(res.text).forEach { Memory.add(it) }
+                        reply.suggest.clear()
+                        reply.suggest.addAll(Smart.suggestions(res.text))
+                        reply.text = Smart.visible(res.text)
+                        reply.brain = res.brain?.id ?: ""
                         reply.images.addAll(imgs)
                         reply.sources.clear()
                         reply.sources.addAll(res.sources)
@@ -991,7 +1006,7 @@ class MainActivity : Activity() {
                 } else Errors.friendly(e)
                 ui.post {
                     ui.removeCallbacks(pushUi)
-                    val partial = synchronized(acc) { acc.toString() }
+                    val partial = Smart.visible(synchronized(acc) { acc.toString() })
                     if (msg == null) {
                         reply.text = partial.ifBlank { "_(أُوقف)_" }
                     } else if (partial.isNotBlank()) {
@@ -1181,6 +1196,7 @@ class MainActivity : Activity() {
             for (path in msg.images) extras.addView(imageView(path), Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(6) })
             if (msg.opinions.isNotEmpty()) extras.addView(opinionsView(msg))
             if (msg.sources.isNotEmpty()) extras.addView(sourcesView(msg))
+            if (msg.suggest.isNotEmpty() && chat.msgs.lastOrNull() === msg && running == null) extras.addView(suggestView(msg))
             val files = Md.files(msg.text)
             if (files.isNotEmpty()) {
                 extras.addView(Ui.button(this@MainActivity, "📦 المشروع: ${files.size} ملف — تنزيل أو بناء", true, R.drawable.ic_build) {
@@ -1273,6 +1289,65 @@ class MainActivity : Activity() {
         return box
     }
 
+    private fun suggestView(m: Msg): View {
+        val p = Ui.p
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        for (q in m.suggest) {
+            box.addView(Ui.text(this, 14f, p.accent).apply {
+                text = "↖  $q"
+                background = Ui.pressable(this@MainActivity, p.surface, 14, p.divider)
+                setPadding(dp(12), dp(9), dp(12), dp(9))
+                textDirection = View.TEXT_DIRECTION_FIRST_STRONG
+                setOnClickListener { if (running == null) send(q) }
+            }, Ui.lp(Ui.WRAP, Ui.WRAP).apply { bottomMargin = dp(6) })
+        }
+        return box
+    }
+
+    /** Asks a different model (which may search the web) to check an answer. */
+    private fun verify(m: Msg) {
+        if (running != null) return
+        val idx = chat.msgs.indexOf(m)
+        val question = chat.msgs.take(maxOf(0, idx)).lastOrNull { it.role == "user" }?.text ?: ""
+        val reply = Msg(role = "assistant", model = "تحقّق")
+        chat.msgs.add(reply)
+        val h = addView(reply)
+        h.setStreaming(true)
+        h.render(true)
+        scrollDown(true)
+        val cancel = Cancel()
+        running = cancel
+        updateSendIcon()
+        val st: (String) -> Unit = { s -> ui.post { if (running === cancel) status(s) } }
+        val answeredBy = m.brain.substringBefore(':')
+        exec.execute {
+            try {
+                val prompt = "راجع الإجابة التالية بدقة كخبير ومدقق حقائق.\n\nالسؤال:\n$question\n\nالإجابة المراد التحقق منها:\n${m.text}\n\n" +
+                    "ابحث عن أي خطأ في المعلومات أو الأرقام أو الحسابات أو المنطق أو أي نقص مهم (ابحث في الويب إن احتجت). " +
+                    "ابدأ بسطر واحد: «✅ الإجابة صحيحة» أو «⚠️ فيها أخطاء» أو «ℹ️ صحيحة مع ملاحظات»، ثم اذكر التصحيحات باختصار ووضوح."
+                val plan = Agent.Plan(Smart.Task.GENERAL, true, false)
+                val chain = Router.autoChain().sortedBy { if (it.p.id == answeredBy) 1 else 0 }
+                val res = Agent.run(chain, Req(listOf(Turn("user", prompt, emptyList())), systemPrompt()), plan, cancel, st) { _, _ -> }
+                ui.post {
+                    reply.text = Smart.visible(res.text)
+                    reply.sources.addAll(res.sources)
+                    reply.model = "تحقّق · " + (res.brain?.label ?: "")
+                    reply.brain = res.brain?.id ?: ""
+                    finishReply(reply, h)
+                }
+            } catch (e: Exception) {
+                ui.post {
+                    if (!(e is ApiError && e.kind == Kind.CANCELLED)) reply.error = if (e is ApiError) Errors.friendly(e) else (e.message ?: "")
+                    else reply.text = "_(أُوقف)_"
+                    finishReply(reply, h)
+                }
+            }
+        }
+    }
+
     private fun messageMenu(m: Msg) {
         val items = ArrayList<String>()
         items += "نسخ النص"
@@ -1280,6 +1355,7 @@ class MainActivity : Activity() {
         items += "مشاركة"
         if (m.role == "assistant") items += "قراءة بصوت"
         if (m.role == "user") items += "تعديل وإعادة الإرسال"
+        if (m.role == "assistant") items += "تحقّق من صحة الإجابة بنموذج آخر"
         if (m.role == "assistant") items += "إعادة التوليد بنموذج آخر"
         items += "حذف الرسالة"
         Ui.pick(this, "الرسالة", items) { k ->
@@ -1289,6 +1365,7 @@ class MainActivity : Activity() {
                 "مشاركة" -> Ui.shareText(this, m.text)
                 "قراءة بصوت" -> Speaker.speak(this, m.id, m.text)
                 "تعديل وإعادة الإرسال" -> editUser(m)
+                "تحقّق من صحة الإجابة بنموذج آخر" -> verify(m)
                 "إعادة التوليد بنموذج آخر" -> {
                     pickModel()
                 }

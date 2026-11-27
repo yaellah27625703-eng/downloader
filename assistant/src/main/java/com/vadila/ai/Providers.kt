@@ -16,6 +16,8 @@ class Req(
     val system: String,
     val search: Boolean = false,
     val wantImage: Boolean = false,
+    /** Ask for deep reasoning (models that support it). */
+    val think: Boolean = false,
 )
 
 /** A provider + model pair. */
@@ -79,12 +81,22 @@ object GeminiApi {
         val body = J.o("contents" to contents)
         if (req.system.isNotBlank()) body["systemInstruction"] = J.o("parts" to J.a(J.o("text" to req.system)))
         body["safetySettings"] = SAFETY
-        if (req.wantImage || b.model.contains("image") || b.model.contains("banana")) {
-            body["generationConfig"] = J.o("responseModalities" to J.a("TEXT", "IMAGE"))
-        }
+        val gen = J.o()
+        val imageModel = req.wantImage || b.model.contains("image") || b.model.contains("banana")
+        if (imageModel) gen["responseModalities"] = J.a("TEXT", "IMAGE")
+        if (req.think && !imageModel && !b.model.startsWith("gemma")) gen["thinkingConfig"] = J.o("thinkingLevel" to "high")
+        if (gen.isNotEmpty()) body["generationConfig"] = gen
         if (req.search) body["tools"] = J.a(J.o("google_search" to J.o()))
         val url = "$BASE/v1beta/models/${b.model}:streamGenerateContent?alt=sse"
-        Net.sse(Net.jsonPost(url, headers(), body), "gemini", cancel) { _, data -> out.add(Decode.gemini(data)) }
+        try {
+            Net.sse(Net.jsonPost(url, headers(), body), "gemini", cancel) { _, data -> out.add(Decode.gemini(data)) }
+        } catch (e: ApiError) {
+            if (req.think && e.kind == Kind.BAD && out.empty && (e.message ?: "").contains("think", ignoreCase = true)) {
+                chat(b, Req(req.turns, req.system, req.search, req.wantImage, false), out, cancel)
+                return
+            }
+            throw e
+        }
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -312,9 +324,14 @@ object ClaudeApi {
         val body = J.o("model" to b.model, "max_tokens" to maxTokens, "messages" to msgs, "stream" to true)
         if (req.system.isNotBlank()) body["system"] = req.system
         if (req.search) body["tools"] = J.a(J.o("type" to "web_search_20250305", "name" to "web_search", "max_uses" to 5))
+        if (req.think) body["thinking"] = J.o("type" to "enabled", "budget_tokens" to minOf(12000, maxTokens / 2))
         try {
             Net.sse(Net.jsonPost("$URL/messages", headers(), body), "anthropic", cancel) { ev, data -> out.add(Decode.claude(ev, data)) }
         } catch (e: ApiError) {
+            if (e.kind == Kind.BAD && out.empty && req.think && (e.message ?: "").contains("think", ignoreCase = true)) {
+                chat(b, Req(req.turns, req.system, req.search, req.wantImage, false), out, cancel, maxTokens)
+                return
+            }
             if (e.kind == Kind.BAD && out.empty && maxTokens > 8192 && (e.message ?: "").contains("max_tokens")) {
                 chat(b, req, out, cancel, 8192)
                 return
@@ -399,9 +416,21 @@ object OaiApi {
             }
         }
         val body = J.o("model" to b.model, "messages" to msgs, "stream" to true)
+        val m = b.model.lowercase()
+        val reasoning = req.think && when (p.id) {
+            "openai" -> m.startsWith("gpt-5") || m.startsWith("gpt-6") || Regex("^o\\d").containsMatchIn(m)
+            "groq", "cerebras", "openrouter" -> m.contains("gpt-oss")
+            "github" -> m.contains("gpt-5") || m.contains("/o3") || m.contains("/o4")
+            else -> false
+        }
+        if (reasoning) body["reasoning_effort"] = "high"
         try {
             Net.sse(Net.jsonPost(chatUrl(p), headers(p), body), p.id, cancel) { _, data -> out.add(Decode.openai(data)) }
         } catch (e: ApiError) {
+            if (reasoning && e.kind == Kind.BAD && out.empty && (e.message ?: "").contains("reasoning", ignoreCase = true)) {
+                chat(b, Req(req.turns, req.system, req.search, req.wantImage, false), out, cancel)
+                return
+            }
             // some accounts may not stream certain models (e.g. unverified OpenAI organisations): ask once without streaming
             if (e.kind == Kind.BAD && out.empty && (e.message ?: "").contains("stream", ignoreCase = true)) {
                 body["stream"] = false

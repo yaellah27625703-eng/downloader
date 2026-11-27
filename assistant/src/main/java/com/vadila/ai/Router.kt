@@ -209,7 +209,7 @@ object Router {
         }
         // models must see a user message first
         while (kept.isNotEmpty() && kept.first().role != "user") kept.removeAt(0)
-        return Req(kept + lastTurn, req.system, req.search, req.wantImage)
+        return Req(kept + lastTurn, req.system, req.search, req.wantImage, req.think)
     }
 
     // ---- running --------------------------------------------------------------------------------

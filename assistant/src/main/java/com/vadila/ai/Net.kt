@@ -20,12 +20,21 @@ class Cancel {
     @Volatile
     var call: Call? = null
 
+    private val children = java.util.concurrent.CopyOnWriteArrayList<Cancel>()
+
+    /** A cancel that stops on its own or when this one stops. */
+    fun child(): Cancel = Cancel().also {
+        children.add(it)
+        if (stopped) it.stop()
+    }
+
     fun stop() {
         stopped = true
         try {
             call?.cancel()
         } catch (e: Exception) {
         }
+        for (c in children) c.stop()
     }
 
     fun check() {

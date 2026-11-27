@@ -60,6 +60,7 @@ class SettingsActivity : Activity() {
         root.addView(scroll, Ui.lp(Ui.MATCH, 0, 1f))
         setContentView(root)
 
+        smartSection()
         deviceSection()
 
         section("المفاتيح")
@@ -120,6 +121,47 @@ class SettingsActivity : Activity() {
         content.addView(Ui.button(this, "فتح المستودع (الكود المصدري)", false, R.drawable.ic_open) {
             Ui.open(this, "https://github.com/yaellah27625703-eng/downloader/tree/main/assistant")
         }, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(8) })
+    }
+
+    // ---- intelligence -----------------------------------------------------------------------------
+    private fun smartSection() {
+        val p = Ui.p
+        section("الذكاء")
+        toggle("يبحث في الويب ويقرأ الروابط ويحسب بنفسه عند الحاجة", "auto_tools", true)
+        toggle("تفكير عميق تلقائي للأسئلة الصعبة (رياضيات، برمجة، تحليل)", "smart_think", true)
+        toggle("يعطي الأسئلة الصعبة لأقوى نموذج عندك (مع المفاتيح المدفوعة قد يكلّف أكثر)", "smart_max", true)
+        toggle("اقتراح أسئلة متابعة بعد كل إجابة", "suggestions", true)
+        toggle("يتذكّر ما تخبره به عن نفسك (يُحفظ في هاتفك فقط)", "memory_on", true)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun fill() {
+            box.removeAllViews()
+            val facts = Memory.all()
+            box.addView(Ui.text(this, 14f, p.text, true).apply {
+                text = if (facts.isEmpty()) "الذاكرة فارغة — قل له مثلًا: «تذكّر أن اسمي …»" else "ما يتذكّره عنك (${facts.size}) — اضغط على معلومة لحذفها:"
+                setPadding(dp(4), dp(6), dp(4), dp(4))
+            })
+            for ((k, f) in facts.withIndex()) {
+                box.addView(Ui.text(this, 13.5f, p.text).apply {
+                    text = "• $f"
+                    background = Ui.pressable(this@SettingsActivity, p.surface, 12)
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                    setOnClickListener {
+                        Ui.confirm(this@SettingsActivity, "حذف من الذاكرة", f, "حذف") {
+                            Memory.remove(k)
+                            fill()
+                        }
+                    }
+                }, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(4) })
+            }
+            if (facts.isNotEmpty()) box.addView(Ui.button(this, "مسح الذاكرة كلها", false, R.drawable.ic_delete) {
+                Ui.confirm(this, "مسح الذاكرة", "سينسى المساعد كل ما تعلّمه عنك.", "مسح") {
+                    Memory.clear()
+                    fill()
+                }
+            }, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(4) })
+        }
+        fill()
+        content.addView(box, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(6) })
     }
 
     // ---- offline models ---------------------------------------------------------------------------

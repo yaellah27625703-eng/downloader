@@ -52,11 +52,16 @@ class Msg(
     val opinions: MutableList<Opinion> = ArrayList(),
     /** GitHub build of this answer's project: "owner/repo". */
     var repo: String? = null,
+    /** Follow-up questions the model suggested. */
+    val suggest: MutableList<String> = ArrayList(),
+    /** provider:model that wrote this answer. */
+    var brain: String = "",
 ) {
     fun toMap(): Map<String, Any?> = J.o(
         "id" to id, "role" to role, "text" to text, "atts" to atts.map { it.toMap() }, "images" to images,
         "sources" to sources.map { J.o("t" to it.title, "u" to it.url) }, "model" to model, "error" to error, "time" to time,
         "opinions" to opinions.map { J.o("l" to it.label, "t" to it.text, "ok" to it.ok) }, "repo" to repo,
+        "suggest" to suggest, "brain" to brain,
     )
 
     companion object {
@@ -72,6 +77,8 @@ class Msg(
             time = m.num("time")?.toLong() ?: 0,
             opinions = m.list("opinions").map { Opinion(it.str("l") ?: "", it.str("t") ?: "", it.bool("ok") ?: true) }.toMutableList(),
             repo = m.str("repo"),
+            suggest = m.list("suggest").mapNotNull { it as? String }.toMutableList(),
+            brain = m.str("brain") ?: "",
         )
     }
 }
