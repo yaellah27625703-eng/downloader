@@ -11,10 +11,6 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
-import okhttp3.Request
-import java.io.File
-import java.io.FileOutputStream
-import java.io.IOException
 
 /** Downloads an offline model in the background (resumable), with a progress notification. */
 class ModelService : Service() {
@@ -94,55 +90,21 @@ class ModelService : Service() {
     }
 
     private fun download(m: OnDevice.Model, nm: NotificationManager) {
-        val target = OnDevice.file(m)
-        if (OnDevice.installed(m)) return
-        val part = File(OnDevice.dir, m.file + ".part")
-        var attempt = 0
-        while (true) {
-            if (stop) return
-            val have = if (part.exists()) part.length() else 0L
-            if (OnDevice.freeBytes() < (m.bytes - have) + 300_000_000L) {
-                throw IOException("المساحة غير كافية: يحتاج نحو ${"%.1f".format((m.bytes - have) / 1e9)} غيغابايت فارغة.")
-            }
-            try {
-                val req = Request.Builder().url(m.url).header("User-Agent", "VadilaAI/1.1")
-                if (have > 0) req.header("Range", "bytes=$have-")
-                Net.exec(req.build(), "hf").use { r ->
-                    val append = have > 0 && r.code == 206
-                    val len = r.body?.contentLength() ?: -1L
-                    total = if (len > 0) (if (append) have + len else len) else m.bytes
-                    done = if (append) have else 0L
-                    val src = r.body?.byteStream() ?: throw IOException("رد فارغ")
-                    FileOutputStream(part, append).use { o ->
-                        val buf = ByteArray(1 shl 17)
-                        var lastNote = 0L
-                        while (true) {
-                            if (stop) return
-                            val n = src.read(buf)
-                            if (n < 0) break
-                            o.write(buf, 0, n)
-                            done += n
-                            val now = System.currentTimeMillis()
-                            if (now - lastNote > 1000) {
-                                lastNote = now
-                                nm.notify(NOTE_ID, note(m.name, done, total, null))
-                            }
-                        }
-                    }
+        var lastNote = 0L
+        OnDevice.download(
+            m.url, OnDevice.file(m), m.bytes,
+            progress = { d, t ->
+                done = d
+                total = t
+                val now = System.currentTimeMillis()
+                if (now - lastNote > 1000) {
+                    lastNote = now
+                    nm.notify(NOTE_ID, note(m.name, d, t, null))
                 }
-                if (part.length() >= total * 0.98 || total <= 0) {
-                    part.renameTo(target)
-                    return
-                }
-                throw IOException("انقطع التنزيل")
-            } catch (e: Exception) {
-                if (stop) return
-                if (e is ApiError && (e.kind == Kind.GONE || e.kind == Kind.AUTH)) throw e
-                attempt++
-                if (attempt > 30) throw e
-                Thread.sleep(minOf(30_000L, 2000L * attempt))
-            }
-        }
+            },
+            stopped = { stop },
+            status = { s -> nm.notify(NOTE_ID, note(m.name, done, total, s)) },
+        )
     }
 
     private fun note(name: String, cur: Long, max: Long, text: String?, finished: Boolean = false): Notification {

@@ -38,7 +38,7 @@ class Brain(val p: ProviderDef, val model: String) {
             "github" -> 14_000
             "groq" -> if (model.contains("compound")) 12_000 else 18_000
             "custom" -> 24_000
-            "device" -> 7_000
+            "device" -> 6_000
             else -> 12_000
         }
 }

@@ -2,6 +2,7 @@ package com.vadila.ai
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -111,7 +112,8 @@ class SettingsActivity : Activity() {
         note(
             "Vadila AI — الإصدار ${packageManager.getPackageInfo(packageName, 0).versionName}\n" +
                 "مفتوح المصدر: الكود كاملًا في مستودعك على GitHub.\n\n" +
-                "بصراحة: لا يوجد ذكاء اصطناعي بلا حدود مجانًا. التطبيق يطيل العمل المجاني بالتنقل بين خدمات كثيرة، " +
+                "بصراحة: الخدمات السحابية المجانية لها حصص يومية، والتطبيق يطيل العمل بالتنقل بينها. " +
+                "أما نموذج «بلا إنترنت» فيعمل داخل هاتفك بلا حدود ولا مفتاح، لكنه أضعف من النماذج السحابية الكبيرة. " +
                 "ومفاتيح Claude وOpenAI تُدفع حسب الاستعمال ولا تعمل باشتراك claude.ai أو ChatGPT Plus. " +
                 "تُحفظ المفاتيح داخل هاتفك فقط وتُرسل مباشرة إلى كل خدمة.",
         )
@@ -155,6 +157,82 @@ class SettingsActivity : Activity() {
         content.addView(head, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(8) })
         for (m in OnDevice.MODELS) deviceCard(m)
         toggle("استعمله أولًا حتى مع وجود الإنترنت (خصوصية تامة)", "device_first", false)
+        content.addView(Ui.button(this, "عندي ملف النموذج (.litertlm): استيراده", false, R.drawable.ic_file) {
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 41)
+        }, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(6) })
+        note("مفيد إذا كان الإنترنت ضعيفًا: نزّل الملف على الحاسوب من صفحة النموذج في Hugging Face، ثم انقله إلى الهاتف واستورده.")
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 41 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val name = Media.nameOf(this, uri)
+        val size = try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+        } catch (e: Exception) {
+            -1L
+        }
+        val byName = OnDevice.MODELS.firstOrNull { it.file.equals(name, ignoreCase = true) }
+        val bySize = OnDevice.MODELS.firstOrNull { size > 0 && Math.abs(size - it.bytes) < it.bytes * 0.06 }
+        val guess = byName ?: bySize
+        if (!name.endsWith(".litertlm", ignoreCase = true)) {
+            Ui.toast(this, "اختر ملفًا بامتداد .litertlm")
+            return
+        }
+        if (guess != null) importModel(uri, guess, size)
+        else Ui.pick(this, "أي نموذج هذا؟", OnDevice.MODELS.map { it.name }) { k -> importModel(uri, OnDevice.MODELS[k], size) }
+    }
+
+    private fun importModel(uri: android.net.Uri, m: OnDevice.Model, size: Long) {
+        val bar = Ui.progress(this)
+        val tv = Ui.text(this, 14f, Ui.p.text).apply { text = "ينسخ ${m.name}…" }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(14), dp(22), dp(6))
+            addView(tv)
+            addView(bar, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(10) })
+        }
+        val d = android.app.AlertDialog.Builder(this).setTitle("استيراد النموذج").setView(box).setCancelable(false).show()
+        exec.execute {
+            val part = File(OnDevice.dir, m.file + ".part")
+            val target = OnDevice.file(m)
+            val ok = try {
+                if (OnDevice.freeBytes() < size + 100_000_000L) throw java.io.IOException("المساحة غير كافية")
+                contentResolver.openInputStream(uri)!!.use { input ->
+                    java.io.FileOutputStream(part).use { out ->
+                        val buf = ByteArray(1 shl 20)
+                        var done = 0L
+                        var last = 0L
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            out.write(buf, 0, n)
+                            done += n
+                            val now = System.currentTimeMillis()
+                            if (now - last > 300 && size > 0) {
+                                last = now
+                                val pct = (done * 1000 / size).toInt()
+                                ui.post { bar.progress = pct; tv.text = "ينسخ ${m.name}… %.1f%%".format(pct / 10.0) }
+                            }
+                        }
+                    }
+                }
+                if (part.length() < 1_000_000) throw java.io.IOException("الملف صغير جدًا")
+                target.delete()
+                part.renameTo(target)
+                if (Prefs.get("model_device").isBlank()) Prefs.set("model_device", m.id)
+                null
+            } catch (e: Exception) {
+                part.delete()
+                e.message ?: e.toString()
+            }
+            ui.post {
+                d.dismiss()
+                Ui.toast(this, if (ok == null) "✓ استُورد ${m.name} — يعمل الآن بلا إنترنت" else "تعذّر الاستيراد: $ok")
+            }
+        }
     }
 
     private fun deviceCard(m: OnDevice.Model) {

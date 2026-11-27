@@ -61,6 +61,11 @@ object OnDevice {
         dir = (ctx.getExternalFilesDir("models") ?: File(ctx.filesDir, "models")).apply { mkdirs() }
     }
 
+    /** For tests on a computer. */
+    fun useDir(d: File) {
+        dir = d.apply { mkdirs() }
+    }
+
     fun byId(id: String): Model? = MODELS.firstOrNull { it.id == id }
     fun file(m: Model) = File(dir, m.file)
 
@@ -92,6 +97,100 @@ object OnDevice {
         if (engineModel == m.id) release()
         file(m).delete()
         File(dir, m.file + ".part").delete()
+        File(dir, m.file + ".sha256").delete()
+    }
+
+    // ---- downloading ------------------------------------------------------------------------------
+    /**
+     * Downloads [url] to [target] through a ".part" file, resuming after interruptions, and checks the
+     * SHA-256 that Hugging Face publishes for the file. [progress] gets (done, total).
+     */
+    fun download(
+        url: String,
+        target: File,
+        expectedBytes: Long,
+        progress: (Long, Long) -> Unit,
+        stopped: () -> Boolean,
+        status: (String) -> Unit = {},
+        maxAttempts: Int = 30,
+        pauseMs: (Int) -> Long = { minOf(30_000L, 2000L * it) },
+    ) {
+        if (target.exists() && target.length() > 1_000_000) return
+        val part = File(target.path + ".part")
+        val shaFile = File(target.path + ".sha256")
+        var attempt = 0
+        while (true) {
+            if (stopped()) return
+            val have = if (part.exists()) part.length() else 0L
+            val free = try { StatFs(target.parentFile!!.path).availableBytes } catch (e: Throwable) { Long.MAX_VALUE }
+            if (free < (expectedBytes - have) + 300_000_000L) {
+                throw java.io.IOException("المساحة غير كافية: يحتاج نحو %.1f غيغابايت فارغة.".format((expectedBytes - have) / 1e9))
+            }
+            var total = expectedBytes
+            try {
+                val req = okhttp3.Request.Builder().url(url).header("User-Agent", "VadilaAI/1.1")
+                if (have > 0) req.header("Range", "bytes=$have-")
+                Net.exec(req.build(), "hf").use { r ->
+                    // Hugging Face names the file's SHA-256 on the first (redirect) response
+                    val sha = (r.priorResponse?.header("x-linked-etag") ?: r.header("x-linked-etag"))?.trim('"', ' ', 'W', '/')
+                    if (sha != null && sha.length == 64 && !shaFile.exists()) shaFile.writeText(sha)
+                    val append = have > 0 && r.code == 206
+                    val len = r.body?.contentLength() ?: -1L
+                    total = if (len > 0) (if (append) have + len else len) else expectedBytes
+                    var done = if (append) have else 0L
+                    val src = r.body?.byteStream() ?: throw java.io.IOException("رد فارغ")
+                    java.io.FileOutputStream(part, append).use { o ->
+                        val buf = ByteArray(1 shl 17)
+                        var last = 0L
+                        while (true) {
+                            if (stopped()) return
+                            val n = src.read(buf)
+                            if (n < 0) break
+                            o.write(buf, 0, n)
+                            done += n
+                            val now = System.currentTimeMillis()
+                            if (now - last > 500) {
+                                last = now
+                                progress(done, total)
+                            }
+                        }
+                    }
+                    progress(done, total)
+                }
+                if (part.length() < total) throw java.io.IOException("انقطع التنزيل")
+                val expected = if (shaFile.exists()) shaFile.readText().trim() else null
+                if (expected != null) {
+                    status("يتحقق من سلامة الملف…")
+                    if (sha256(part) != expected) {
+                        part.delete()
+                        throw java.io.IOException("الملف تالف؛ سيُعاد تنزيله")
+                    }
+                }
+                if (!part.renameTo(target)) throw java.io.IOException("تعذّر حفظ الملف")
+                shaFile.delete()
+                return
+            } catch (e: Exception) {
+                if (stopped()) return
+                if (e is ApiError && (e.kind == Kind.GONE || e.kind == Kind.AUTH)) throw e
+                attempt++
+                if (attempt >= maxAttempts) throw e
+                status("انقطع الاتصال — يستأنف التنزيل…")
+                Thread.sleep(pauseMs(attempt))
+            }
+        }
+    }
+
+    fun sha256(f: File): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { s ->
+            val buf = ByteArray(1 shl 20)
+            while (true) {
+                val n = s.read(buf)
+                if (n < 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
     }
 
     /** True when the phone has a working internet connection. */
@@ -113,9 +212,9 @@ object OnDevice {
     private var engineMedia = false
     private val lock = Any()
 
-    private fun open(m: Model, media: Boolean, status: (String) -> Unit): Engine = synchronized(lock) {
+    private fun open(m: Model, status: (String) -> Unit): Engine = synchronized(lock) {
         val current = engine
-        if (current != null && engineModel == m.id && (!media || engineMedia)) return current
+        if (current != null && engineModel == m.id) return current
         release()
         status("يحمّل ${m.name} في ذاكرة الهاتف… (أول مرة قد تستغرق دقيقة)")
         val tryGpuFirst = Prefs.get("device_backend", "gpu") != "cpu"
@@ -123,14 +222,15 @@ object OnDevice {
         var last: Throwable? = null
         for (gpu in attempts) {
             try {
-                val withMedia = media && m.multimodal
+                // the vision and audio parts are only loaded when a picture or a recording is sent
+                val withMedia = m.multimodal
                 val e = Engine(
                     EngineConfig(
                         modelPath = file(m).path,
                         backend = if (gpu) Backend.GPU() else Backend.CPU(),
                         visionBackend = if (withMedia) (if (gpu) Backend.GPU() else Backend.CPU()) else null,
                         audioBackend = if (withMedia) Backend.CPU() else null,
-                        maxNumTokens = 4096,
+                        maxNumTokens = if (m.multimodal) 8192 else 4096,
                         cacheDir = app.cacheDir.path,
                     ),
                 )
@@ -195,8 +295,7 @@ object OnDevice {
         val m = byId(b.model) ?: throw ApiError(Kind.GONE, 0, "النموذج غير معروف")
         if (!installed(m)) throw ApiError(Kind.GONE, 0, "نزّل نموذج «بلا إنترنت» أولًا من الإعدادات.")
         val last = req.turns.last()
-        val media = m.multimodal && last.atts.any { it.isImage || it.isPdf || it.isVideo || it.isAudio }
-        val eng = open(m, media, status)
+        val eng = open(m, status)
         cancel.check()
         val history = req.turns.dropLast(1).map { t ->
             val note = if (t.atts.isNotEmpty()) "\n[مرفقات: " + t.atts.joinToString("، ") { it.name } + "]" else ""
