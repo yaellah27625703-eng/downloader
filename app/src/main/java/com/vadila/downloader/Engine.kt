@@ -699,7 +699,7 @@ object Engine {
     }
 
     /** Copies the finished file into the public Download/Downloader folder. */
-    private fun publishFile(name: String, mime: String, temp: File): Uri {
+    fun publishFile(name: String, mime: String, temp: File): Uri {
         val resolver = ctx.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, name)

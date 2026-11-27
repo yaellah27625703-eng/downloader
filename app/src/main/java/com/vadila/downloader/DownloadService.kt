@@ -60,7 +60,7 @@ class DownloadService : Service() {
 
     private val tick = object : Runnable {
         override fun run() {
-            val active = Engine.activeCount()
+            val active = Engine.activeCount() + Dub.activeCount()
             syncBubble()
             if (active == 0 && bubble == null) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -134,8 +134,13 @@ class DownloadService : Service() {
             }
             if (p >= 0) { pctSum += p; known++ }
         }
-        val text = if (running.isEmpty() && queued == 0) "الزر العائم مفعّل • انسخ رابطًا ثم اضغط الزر"
-        else "يجري تنزيل ${running.size} • في الانتظار $queued • ${Engine.fmtBytes(Engine.totalSpeed())}/ث"
+        val dubs = Dub.activeCount()
+        val text = when {
+            running.isEmpty() && queued == 0 && dubs > 0 -> "تجري دبلجة $dubs فيديو إلى العربية"
+            running.isEmpty() && queued == 0 -> "الزر العائم مفعّل • انسخ رابطًا ثم اضغط الزر"
+            else -> "يجري تنزيل ${running.size} • في الانتظار $queued • ${Engine.fmtBytes(Engine.totalSpeed())}/ث" +
+                (if (dubs > 0) " • دبلجة $dubs" else "")
+        }
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT

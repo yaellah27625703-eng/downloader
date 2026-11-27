@@ -160,6 +160,7 @@ class DownloadsPage(private val a: MainActivity) {
         val badge: TextView,
         val action: ImageButton,
         val open: ImageButton,
+        val dub: ImageButton,
         val delete: ImageButton,
         val card: LinearLayout,
     )
@@ -232,12 +233,14 @@ class DownloadsPage(private val a: MainActivity) {
         bottom.addView(View(a), Ui.lp(0, 1, 1f))
         val action = Ui.iconButton(a, R.drawable.ic_pause, p.accent, "إيقاف/استئناف")
         val open = Ui.iconButton(a, R.drawable.ic_open, p.accent, "فتح")
+        val dub = Ui.iconButton(a, R.drawable.ic_dub, p.accent, "دبلجة إلى العربية")
         val delete = Ui.iconButton(a, R.drawable.ic_delete, p.danger, "حذف")
         bottom.addView(action)
+        bottom.addView(dub)
         bottom.addView(open)
         bottom.addView(delete)
         card.addView(bottom)
-        return Holder(iconBox, icon, name, info, bar, badge, action, open, delete, card)
+        return Holder(iconBox, icon, name, info, bar, badge, action, open, dub, delete, card)
     }
 
     private fun bind(h: Holder, t: Task) {
@@ -307,6 +310,9 @@ class DownloadsPage(private val a: MainActivity) {
         val canOpen = t.status == Status.DONE && t.savedUri != null
         h.open.visibility = if (canOpen) View.VISIBLE else View.GONE
         h.open.setOnClickListener { openFile(t) }
+        val dubbable = canOpen && (Ui.iconFor(t) == R.drawable.ic_movie || Ui.iconFor(t) == R.drawable.ic_music)
+        h.dub.visibility = if (dubbable) View.VISIBLE else View.GONE
+        h.dub.setOnClickListener { a.dubDownload(t) }
         h.card.setOnClickListener { if (canOpen) openFile(t) }
         h.delete.setOnClickListener { confirmDelete(t) }
     }

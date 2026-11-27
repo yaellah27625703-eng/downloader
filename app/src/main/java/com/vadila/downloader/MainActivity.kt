@@ -28,6 +28,7 @@ class MainActivity : Activity() {
 
     lateinit var downloads: DownloadsPage
     lateinit var browser: BrowserPage
+    lateinit var dub: DubPage
     private lateinit var settings: SettingsPage
     private lateinit var pages: FrameLayout
     private lateinit var fullscreen: FrameLayout
@@ -35,6 +36,7 @@ class MainActivity : Activity() {
     private lateinit var subtitle: TextView
     private val navIcons = ArrayList<ImageView>()
     private val navLabels = ArrayList<TextView>()
+    private val navIndex = ArrayList<Int>()
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     var current = 0
         private set
@@ -88,8 +90,10 @@ class MainActivity : Activity() {
         downloads = DownloadsPage(this)
         browser = BrowserPage(this)
         settings = SettingsPage(this)
+        dub = DubPage(this)
         pages.addView(downloads.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
         pages.addView(browser.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
+        pages.addView(dub.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
         pages.addView(settings.view, FrameLayout.LayoutParams(Ui.MATCH, Ui.MATCH))
 
         savedInstanceState?.getString("browserUrl")?.let { browser.restore(it) }
@@ -119,6 +123,7 @@ class MainActivity : Activity() {
         val items = listOf(
             Triple("التنزيلات", R.drawable.ic_download, 0),
             Triple("المتصفح", R.drawable.ic_globe, 1),
+            Triple("الدبلجة", R.drawable.ic_dub, 3),
             Triple("الإعدادات", R.drawable.ic_tune, 2),
         )
         for ((label, icon, idx) in items) {
@@ -130,7 +135,7 @@ class MainActivity : Activity() {
             }
             val iv = ImageView(this).apply {
                 setImageResource(icon)
-                setPadding(dp(18), dp(4), dp(18), dp(4))
+                setPadding(dp(16), dp(4), dp(16), dp(4))
             }
             val tv = Ui.text(this, 12f, p.sub).apply { text = label }
             item.addView(iv, Ui.lp(Ui.WRAP, dp(32)))
@@ -138,6 +143,7 @@ class MainActivity : Activity() {
             bar.addView(item, Ui.lp(0, Ui.MATCH, 1f))
             navIcons.add(iv)
             navLabels.add(tv)
+            navIndex.add(idx)
         }
         return bar
     }
@@ -148,8 +154,9 @@ class MainActivity : Activity() {
         downloads.view.visibility = if (i == 0) View.VISIBLE else View.GONE
         browser.view.visibility = if (i == 1) View.VISIBLE else View.GONE
         settings.view.visibility = if (i == 2) View.VISIBLE else View.GONE
+        dub.view.visibility = if (i == 3) View.VISIBLE else View.GONE
         for (k in navIcons.indices) {
-            val sel = k == i
+            val sel = navIndex[k] == i
             navIcons[k].imageTintList = ColorStateList.valueOf(if (sel) p.accent else p.sub)
             navIcons[k].background = if (sel) Ui.rounded(this, p.accentSoft, 16) else null
             navLabels[k].setTextColor(if (sel) p.accent else p.sub)
@@ -158,11 +165,13 @@ class MainActivity : Activity() {
         title.text = when (i) {
             0 -> "مدير التنزيلات"
             1 -> "المتصفح"
+            3 -> "الدبلجة إلى العربية"
             else -> "الإعدادات"
         }
         when (i) {
             1 -> browser.onShown()
             2 -> settings.rebuild()
+            3 -> dub.refresh()
         }
         hideKeyboard()
         onTick()
@@ -175,6 +184,7 @@ class MainActivity : Activity() {
         subtitle.text = if (running + queued == 0) "لا توجد تنزيلات جارية"
         else "يعمل $running • في الانتظار $queued • ${Engine.fmtBytes(Engine.totalSpeed())}/ث"
         if (current == 0) downloads.refresh(list)
+        if (current == 3) dub.refresh()
         browser.tick()
     }
 
@@ -196,6 +206,20 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         browser.web.destroy()
         super.onDestroy()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == DubPage.PICK && resultCode == RESULT_OK) data?.data?.let { dub.onPicked(it) }
+    }
+
+    /** Opens the dubbing tab with a finished download already chosen. */
+    fun dubDownload(t: Task) {
+        val uri = t.savedUri ?: return
+        show(3)
+        dub.onPicked(android.net.Uri.parse(uri), t.fileName)
     }
 
     override fun onNewIntent(intent: Intent) {

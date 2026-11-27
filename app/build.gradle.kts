@@ -11,8 +11,8 @@ android {
         applicationId = "com.vadila.downloader"
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "4.0"
+        versionCode = 5
+        versionName = "5.0"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -41,6 +41,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
@@ -59,4 +66,6 @@ dependencies {
     implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
     implementation("io.github.junkfood02.youtubedl-android:aria2c:0.17.2")
+    // Free on-device translation (Google ML Kit)
+    implementation("com.google.mlkit:translate:17.0.3")
 }

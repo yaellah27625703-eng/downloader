@@ -238,6 +238,24 @@ class SettingsPage(private val a: MainActivity) {
         }
         hint(bg, "انسخ رابط فيديو من أي تطبيق (تيك توك، يوتيوب…) ثم اضغط الزر العائم فيبدأ التنزيل بالجودة الافتراضية. اسحبه لتحريكه، واضغط مطوّلًا لفتح التطبيق.")
 
+        // Dubbing
+        val d = section("الدبلجة")
+        switchRow(d, "إبقاء الصوت الأصلي كمسار ثانٍ", Dub.keepOriginal) { Dub.keepOriginal = it }
+        hint(d, "يمكنك التبديل بين العربية والصوت الأصلي من قائمة الصوت في مشغّل الفيديو.")
+        divider(d)
+        lateinit var keyValue: TextView
+        keyValue = row(d, "مفتاح ElevenLabs (للأصوات الأصلية)", if (Dub.apiKey.isBlank()) "غير مضاف" else "مضاف ✓") {
+            a.dub.askKey()
+        }
+        val models = linkedMapOf("dubbing_v2" to "v2 – أعلى جودة", "dubbing_v1" to "v1 – أرخص")
+        val mrow = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(4), 0, dp(4)) }
+        for ((k, label) in models) {
+            mrow.addView(Ui.chip(a, label, Dub.model == k) { Dub.model = k; rebuild() },
+                Ui.lp(Ui.WRAP, Ui.WRAP).apply { marginEnd = dp(8) })
+        }
+        d.addView(mrow)
+        hint(d, "هذان الخياران للدبلجة المدفوعة فقط. الدبلجة المجانية لا تحتاج مفتاحًا.")
+
         // Engine
         val e = section("محرك تنزيل الفيديو")
         val ver = row(e, "الإصدار", "…", null)
@@ -263,7 +281,7 @@ class SettingsPage(private val a: MainActivity) {
         // About
         val about = section("حول")
         about.addView(Ui.text(a, 14f, p.text).apply {
-            text = "مدير التنزيلات – الإصدار 4.0\nتُحفظ الملفات في مجلد Download/Downloader"
+            text = "مدير التنزيلات – الإصدار 5.0\nتُحفظ الملفات في مجلد Download/Downloader"
             setLineSpacing(0f, 1.3f)
             setPadding(dp(4), dp(4), dp(4), dp(4))
         })
