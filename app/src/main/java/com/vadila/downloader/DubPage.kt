@@ -215,9 +215,9 @@ class DubPage(private val a: MainActivity) {
         }
         val free = Dub.engine == "free"
         engineHint.text = when (Dub.engine) {
-            "free" -> "مجاني بالكامل على هاتفك: يفصل أصوات الشخصيات عن الموسيقى والمؤثرات، ويفهم الكلام (Whisper)، ويميّز كل شخصية " +
-                "ويعطيها صوتًا عربيًا خاصًا بها يناسبها (رجل، امرأة، طفل)، وبعلوّ صوتها الأصلي، فوق الموسيقى والمؤثرات والضحكات الأصلية. " +
-                "الأصوات من محرّك هاتفك (آلية)؛ لأصوات الممثلين أنفسهم اختر Colab."
+            "free" -> "مجاني بالكامل على هاتفك: يفصل أصوات الشخصيات عن الموسيقى والمؤثرات، ويفهم الكلام (Whisper)، ويميّز كل شخصية، " +
+                "ويعرف بنموذج مدرَّب إن كانت رجلًا أو امرأة أو طفلًا فيعطيها صوتًا عربيًا يناسبها، بنبرتها وعلوّ صوتها، فوق الموسيقى والمؤثرات الأصلية. " +
+                "الأصوات من محرّك Google في هاتفك (أطبع مع الإنترنت)، وتبقى آلية؛ لأصوات الممثلين أنفسهم اختر Colab."
             "colab" -> "مجاني عبر بطاقة رسومية من Google Colab، بأدق النماذج المجانية: يعزل أصوات الممثلين عن الموسيقى (BS-Roformer)، " +
                 "ويفهم الكلام (Whisper large-v3)، ويميّز كل ممثل، ويترجم (Hunyuan-MT)، ثم ينطق كل جملة بصوت ممثلها ونبرته وانفعاله " +
                 "وبطول الجملة الأصلية (OmniVoice)، فوق الموسيقى والمؤثرات والضحكات الأصلية. تديره من هاتفك."
@@ -591,7 +591,7 @@ class DubPage(private val a: MainActivity) {
                 DubStage.WAITING -> j.status.ifBlank { "تجري الدبلجة…" } + (if (j.engine == "colab") pct else "")
                 DubStage.DOWNLOADING -> "تنزيل الصوت العربي…$pct"
                 DubStage.MERGING -> "دمج الصوت العربي مع الفيديو…$pct"
-                DubStage.DONE -> "اكتملت الدبلجة • في مجلد Download/Downloader"
+                DubStage.DONE -> (if (j.status.startsWith("اكتملت")) j.status else "اكتملت الدبلجة") + " • في مجلد Download/Downloader"
                 DubStage.FAILED -> "فشل: ${j.error ?: "خطأ غير معروف"}"
             }
             val running = j.stage != DubStage.DONE && j.stage != DubStage.FAILED

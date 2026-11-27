@@ -25,6 +25,11 @@ object Sherpa {
     /** Voice fingerprint of a 16 kHz mono clip (null if too short). */
     @JvmStatic external fun embCompute(h: Long, samples: FloatArray, sampleRate: Int): FloatArray?
 
+    @JvmStatic external fun tagCreate(model: String, labels: String, threads: Int): Long
+    @JvmStatic external fun tagFree(h: Long)
+    /** AudioSet probabilities [speech, man speaking, woman speaking, child speaking] of a 16 kHz clip. */
+    @JvmStatic external fun tagSpeech(h: Long, samples: FloatArray, sampleRate: Int): FloatArray?
+
     /** Stereo [offset, offset + n) → mono 16 kHz PCM16 with an anti-aliasing filter; returns samples written. */
     @JvmStatic external fun toMono16k(left: FloatArray, right: FloatArray, offset: Int, n: Int, sampleRate: Int, out: ShortArray): Int
 }

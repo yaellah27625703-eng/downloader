@@ -129,6 +129,54 @@ JNIEXPORT jfloatArray JNICALL FN(embCompute)(JNIEnv *env, jclass cls, jlong h, j
     return ans;
 }
 
+// ------------------------------------------------------------------ man / woman / child (audio tagging)
+
+JNIEXPORT jlong JNICALL FN(tagCreate)(JNIEnv *env, jclass cls, jstring jmodel, jstring jlabels, jint threads) {
+    (void)cls;
+    const char *m = str(env, jmodel), *l = str(env, jlabels);
+    SherpaOnnxAudioTaggingConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.model.ced = m;
+    cfg.model.num_threads = threads > 0 ? threads : 2;
+    cfg.model.provider = "cpu";
+    cfg.labels = l;
+    cfg.top_k = 5;
+    const SherpaOnnxAudioTagging *t = SherpaOnnxCreateAudioTagging(&cfg);
+    unstr(env, jmodel, m);
+    unstr(env, jlabels, l);
+    return (jlong)(intptr_t)t;
+}
+
+JNIEXPORT void JNICALL FN(tagFree)(JNIEnv *env, jclass cls, jlong h) {
+    (void)env; (void)cls;
+    if (h) SherpaOnnxDestroyAudioTagging((const SherpaOnnxAudioTagging *)(intptr_t)h);
+}
+
+/* AudioSet probabilities of [speech, man speaking, woman speaking, child speaking] for a 16 kHz clip. */
+JNIEXPORT jfloatArray JNICALL FN(tagSpeech)(JNIEnv *env, jclass cls, jlong h, jfloatArray jx, jint sr) {
+    (void)cls;
+    if (!h) return NULL;
+    const SherpaOnnxAudioTagging *t = (const SherpaOnnxAudioTagging *)(intptr_t)h;
+    jsize n = (*env)->GetArrayLength(env, jx);
+    jfloat *x = (*env)->GetFloatArrayElements(env, jx, NULL);
+    const SherpaOnnxOfflineStream *st = SherpaOnnxAudioTaggingCreateOfflineStream(t);
+    SherpaOnnxAcceptWaveformOffline(st, sr, x, n);
+    (*env)->ReleaseFloatArrayElements(env, jx, x, JNI_ABORT);
+    float out[4] = {0, 0, 0, 0};
+    const SherpaOnnxAudioEvent *const *res = SherpaOnnxAudioTaggingCompute(t, st, 527);
+    if (res) {
+        for (int i = 0; res[i] != NULL; ++i) {
+            int k = res[i]->index;
+            if (k >= 0 && k < 4) out[k] = res[i]->prob;
+        }
+        SherpaOnnxAudioTaggingFreeResults(res);
+    }
+    SherpaOnnxDestroyOfflineStream(st);
+    jfloatArray ans = (*env)->NewFloatArray(env, 4);
+    (*env)->SetFloatArrayRegion(env, ans, 0, 4, out);
+    return ans;
+}
+
 // ------------------------------------------------------------------ helpers
 
 /*

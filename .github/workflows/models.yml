@@ -1,0 +1,44 @@
+name: On-device models
+
+# Re-hosts the sherpa-onnx models the phone engine downloads on first use, as small single files
+# (the official releases only ship them inside large .tar.bz2 archives).
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/models.yml
+
+permissions:
+  contents: write
+
+jobs:
+  models:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch and repack
+        run: |
+          set -e
+          R=https://github.com/k2-fsa/sherpa-onnx/releases/download
+          mkdir out
+          curl -sSLf --retry 5 -o s.tar.bz2 $R/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2
+          echo "$(sha256sum s.tar.bz2)"
+          tar xjf s.tar.bz2
+          cp sherpa-onnx-spleeter-2stems-fp16/vocals.fp16.onnx out/spleeter-vocals.fp16.onnx
+          cp sherpa-onnx-spleeter-2stems-fp16/accompaniment.fp16.onnx out/spleeter-accompaniment.fp16.onnx
+          curl -sSLf --retry 5 -o c.tar.bz2 $R/audio-tagging-models/sherpa-onnx-ced-mini-audio-tagging-2024-04-19.tar.bz2
+          tar xjf c.tar.bz2
+          cp sherpa-onnx-ced-mini-audio-tagging-2024-04-19/model.int8.onnx out/ced-mini.int8.onnx
+          cp sherpa-onnx-ced-mini-audio-tagging-2024-04-19/class_labels_indices.csv out/audioset-labels.csv
+          curl -sSLf --retry 5 -o out/campplus_sv_en_voxceleb_16k.onnx $R/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
+          ls -la out
+          sha256sum out/*
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: models-1
+          name: نماذج الدبلجة على الهاتف (يستعملها التطبيق تلقائيًا، لا تثبّتها)
+          body: "Spleeter 2-stems (MIT), CED-mini AudioSet tagger (Apache-2.0), CAM++ VoxCeleb (Apache-2.0), from k2-fsa/sherpa-onnx releases."
+          files: out/*
+          prerelease: true
+          make_latest: false

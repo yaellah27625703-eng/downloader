@@ -59,20 +59,26 @@ object Whisper {
     fun modelsDir(ctx: Context): File = ctx.getExternalFilesDir("models") ?: ctx.filesDir
 }
 
-/** One spoken line: start/end (ms), original text, Arabic text, speaker (-1 = not known yet), pitch (Hz). */
-class Line(val t0: Long, val t1: Long, val text: String, var ar: String = "", var spk: Int = -1, var f0: Double = 0.0)
+/**
+ * One spoken line: start/end (ms), original text, Arabic text, speaker (-1 = not known yet), pitch (Hz),
+ * and how a trained classifier hears it: [speech, man, woman, child] probabilities (null = unknown).
+ */
+class Line(val t0: Long, val t1: Long, val text: String, var ar: String = "", var spk: Int = -1, var f0: Double = 0.0,
+           var sex: FloatArray? = null)
 
-/** What the phone pipeline produced: the Arabic voices, and (when separation worked) the music/effects bed. */
-class FreeResult(val voice: File, val background: File?, val residual: File?, val characters: Int)
+/** What the phone pipeline produced: the Arabic voices, (when separation worked) the music/effects bed, the cast. */
+class FreeResult(val voice: File, val background: File?, val residual: File?, val characters: Int, val cast: String)
 
 /** The phone's own Text-to-Speech engine, used for the Arabic voices. */
 class ArabicVoice(ctx: Context) {
     private val ready = CountDownLatch(1)
     @Volatile private var ok = false
-    private val tts: TextToSpeech = TextToSpeech(ctx.applicationContext) { status ->
+    // Google's engine has several Arabic voices (men and women, with natural online versions); if it is
+    // missing, Android falls back to the phone's default engine.
+    private val tts: TextToSpeech = TextToSpeech(ctx.applicationContext, { status ->
         ok = status == TextToSpeech.SUCCESS
         ready.countDown()
-    }
+    }, "com.google.android.tts")
     private var cached: List<Voice>? = null
     private var current = ""
     private var currentPitch = 1f
@@ -142,9 +148,12 @@ object FreeDub {
     private const val SR = 16000            // Whisper input rate
     private const val OUT_SR = 24000         // Arabic voice track rate
     private const val CHUNK_SEC = 600        // transcribe 10 minutes at a time
+    // the models as small single files (re-hosted by this app's build), the official archives as a fallback
+    private const val OWN = "https://github.com/yaellah27625703-eng/downloader/releases/download/models-1"
     private const val REL = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
     private const val SPLEETER_URL = "$REL/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2"
     private const val VOICEPRINT_URL = "$REL/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
+    private const val TAGGER_URL = "$REL/audio-tagging-models/sherpa-onnx-ced-mini-audio-tagging-2024-04-19.tar.bz2"
 
     fun run(ctx: Context, j: DubJob, dir: File, src: File): FreeResult {
         // 1. speech-recognition model (downloaded once)
@@ -199,7 +208,7 @@ object FreeDub {
             }
         }
         return FreeResult(voice, if (separated) File(dir, "bg44.pcm") else null, residual,
-            lines.map { it.spk }.distinct().size)
+            lines.map { it.spk }.distinct().size, cast(lines))
     }
 
     private fun threads() = min(4, max(2, Runtime.getRuntime().availableProcessors() / 2))
@@ -219,6 +228,10 @@ object FreeDub {
         val voc = File(dir, "spleeter-vocals.fp16.onnx")
         val acc = File(dir, "spleeter-accompaniment.fp16.onnx")
         if (voc.length() > 1_000_000 && acc.length() > 1_000_000) return voc to acc
+        val label = "تنزيل نموذج فصل الأصوات عن الموسيقى (مرة واحدة فقط)…"
+        if (runCatching { fetch(j, "$OWN/${voc.name}", voc, label, 19_700_000L); fetch(j, "$OWN/${acc.name}", acc, label, 19_700_000L) }.isSuccess
+            && voc.length() > 1_000_000 && acc.length() > 1_000_000) return voc to acc
+        if (j.cancelled) throw IOException("أُلغيت")
         val tar = File(dir, "spleeter-2stems-fp16.tar.bz2")
         fetch(j, SPLEETER_URL, tar, "تنزيل نموذج فصل الأصوات عن الموسيقى (مرة واحدة فقط)…", 35_271_738L)
         j.status = "تجهيز نموذج فصل الأصوات…"
@@ -244,8 +257,42 @@ object FreeDub {
     private fun ensureVoiceprint(ctx: Context, j: DubJob): File {
         val f = File(Whisper.modelsDir(ctx).apply { mkdirs() }, "campplus_sv_en_voxceleb_16k.onnx")
         if (f.length() > 1_000_000) return f
-        fetch(j, VOICEPRINT_URL, f, "تنزيل نموذج تمييز الأصوات (مرة واحدة فقط)…", 29_596_979L)
+        val label = "تنزيل نموذج تمييز الأصوات (مرة واحدة فقط)…"
+        if (runCatching { fetch(j, "$OWN/${f.name}", f, label, 29_596_979L) }.isFailure) {
+            if (j.cancelled) throw IOException("أُلغيت")
+            fetch(j, VOICEPRINT_URL, f, label, 29_596_979L)
+        }
         return f
+    }
+
+    /** CED (AudioSet): hears whether a line is spoken by a man, a woman or a child. */
+    private fun ensureTagger(ctx: Context, j: DubJob): Pair<File, File> {
+        val dir = Whisper.modelsDir(ctx).apply { mkdirs() }
+        val model = File(dir, "ced-mini.int8.onnx")
+        val labels = File(dir, "audioset-labels.csv")
+        if (model.length() > 1_000_000 && labels.length() > 1000) return model to labels
+        val label = "تنزيل نموذج تمييز الرجال والنساء والأطفال (مرة واحدة فقط)…"
+        if (runCatching { fetch(j, "$OWN/${model.name}", model, label, 10_451_715L); fetch(j, "$OWN/${labels.name}", labels, label, 14_675L) }.isSuccess
+            && model.length() > 1_000_000 && labels.length() > 1000) return model to labels
+        if (j.cancelled) throw IOException("أُلغيت")
+        val tar = File(dir, "ced-mini.tar.bz2")
+        fetch(j, TAGGER_URL, tar, label, 47_658_399L)
+        TarArchiveInputStream(BZip2CompressorInputStream(tar.inputStream().buffered(1 shl 16))).use { t ->
+            while (true) {
+                val e = t.nextEntry ?: break
+                val dst = when (e.name.substringAfterLast('/')) {
+                    "model.int8.onnx" -> model
+                    "class_labels_indices.csv" -> labels
+                    else -> null
+                } ?: continue
+                val part = File(dir, dst.name + ".part")
+                part.outputStream().use { t.copyTo(it, 1 shl 16) }
+                part.renameTo(dst)
+            }
+        }
+        tar.delete()
+        if (model.length() < 1_000_000 || labels.length() < 1000) throw IOException("نموذج تمييز الأصوات ناقص")
+        return model to labels
     }
 
     /** Downloads [url] into [dest], resuming after interruptions. */
@@ -265,6 +312,7 @@ object FreeDub {
                 }
                 val code = c.responseCode
                 if (code == 416) { part.renameTo(dest); return }          // already complete
+                if (code == 404) throw java.io.FileNotFoundException(url)  // not there: no point retrying
                 if (code !in 200..299) throw IOException("تعذّر تنزيل النموذج ($code)")
                 val append = code == 206
                 val expected = if (c.contentLengthLong > 0) c.contentLengthLong + (if (append) have else 0L) else -1L
@@ -287,7 +335,7 @@ object FreeDub {
                 part.renameTo(dest)
                 return
             } catch (e: IOException) {
-                if (j.cancelled || ++attempt >= 8) throw e
+                if (j.cancelled || e is java.io.FileNotFoundException || ++attempt >= 8) throw e
                 Thread.sleep(2000L * attempt)
             }
         }
@@ -405,32 +453,41 @@ object FreeDub {
     private fun speakers(ctx: Context, j: DubJob, raw: List<Line>, pcm: File): List<Line> {
         val model = runCatching { ensureVoiceprint(ctx, j) }.getOrNull()
         if (j.cancelled) throw IOException("أُلغيت")
+        val tagger = runCatching { ensureTagger(ctx, j) }.getOrNull()
+        if (j.cancelled) throw IOException("أُلغيت")
         j.stage = DubStage.PREPARING
         j.status = "تمييز أصوات الشخصيات…"
         j.progress = 0f
         val n = raw.size
         val embs = arrayOfNulls<FloatArray>(n)
         val pitches = DoubleArray(n)
+        val sex = arrayOfNulls<FloatArray>(n)
         var h = 0L
+        var tg = 0L
         try {
             if (model != null) runCatching { Sherpa.load(); h = Sherpa.embCreate(model.absolutePath, threads()) }
+            if (tagger != null) runCatching {
+                Sherpa.load(); tg = Sherpa.tagCreate(tagger.first.absolutePath, tagger.second.absolutePath, threads())
+            }
             RandomAccessFile(pcm, "r").use { raf ->
                 for ((i, l) in raw.withIndex()) {
                     if (j.cancelled) throw IOException("أُلغيت")
                     val x = readPcm(raf, l.t0, l.t1)
                     pitches[i] = Voices.pitch(if (x.size > SR * 4) x.copyOf(SR * 4) else x, SR)
                     if (h != 0L && x.size >= SR / 2) embs[i] = runCatching { Sherpa.embCompute(h, x, SR) }.getOrNull()
+                    if (tg != 0L && x.size >= SR / 2) sex[i] = runCatching { Sherpa.tagSpeech(tg, x, SR) }.getOrNull()
                     j.progress = (i + 1) * 100f / n
                 }
             }
         } finally {
             if (h != 0L) Sherpa.embFree(h)
+            if (tg != 0L) Sherpa.tagFree(tg)
         }
         val durs = DoubleArray(n) { (raw[it].t1 - raw[it].t0) / 1000.0 }
         val starts = DoubleArray(n) { raw[it].t0 / 1000.0 }
         // no fingerprints (model unavailable): one voice for everyone rather than voices that flip
-        val labels = if (embs.any { it != null }) Voices.speakers(embs.toList(), durs, starts, pitches) else IntArray(n)
-        for (i in 0 until n) { raw[i].spk = labels[i]; raw[i].f0 = pitches[i] }
+        val labels = if (embs.any { it != null }) Voices.speakers(embs.toList(), durs, starts, sex.toList()) else IntArray(n)
+        for (i in 0 until n) { raw[i].spk = labels[i]; raw[i].f0 = pitches[i]; raw[i].sex = sex[i] }
         return mergeSameSpeaker(raw)
     }
 
@@ -444,7 +501,19 @@ object FreeDub {
             val gap = l.t0 - c.t1
             val ends = c.text.trimEnd().lastOrNull()?.let { it in ".!?؟。！？" } ?: false
             if (l.spk == c.spk && !ends && gap < 700 && c.text.length + l.text.length < 220 && l.t1 - c.t0 < 15000) {
-                cur = Line(c.t0, l.t1, c.text + " " + l.text, spk = c.spk, f0 = if (c.f0 > 0) c.f0 else l.f0)
+                val d1 = (c.t1 - c.t0).toDouble().coerceAtLeast(1.0)
+                val d2 = (l.t1 - l.t0).toDouble().coerceAtLeast(1.0)
+                val f0 = when {
+                    c.f0 > 0 && l.f0 > 0 -> (c.f0 * d1 + l.f0 * d2) / (d1 + d2)
+                    c.f0 > 0 -> c.f0
+                    else -> l.f0
+                }
+                val a = c.sex; val b = l.sex
+                val sex = when {
+                    a != null && b != null -> FloatArray(4) { ((a[it] * d1 + b[it] * d2) / (d1 + d2)).toFloat() }
+                    else -> a ?: b
+                }
+                cur = Line(c.t0, l.t1, c.text + " " + l.text, spk = c.spk, f0 = f0, sex = sex)
             } else {
                 out.add(c); cur = l
             }
@@ -498,26 +567,49 @@ object FreeDub {
 
     // ------------------------------------------------------------------ Arabic voices
 
-    /** The phone's Arabic voices and how high each one sounds (measured once, then remembered). */
+    /**
+     * The phone's Arabic voices: one per voice identity, the natural online version when it works now
+     * (Google's network voices), otherwise the offline one; each with its pitch and whether it is a man's
+     * or a woman's voice (measured once, then remembered).
+     */
     private fun profileVoices(ctx: Context, tts: ArabicVoice, clip: File): List<Voices.PhoneVoice> {
         val prefs = ctx.getSharedPreferences("voices", Context.MODE_PRIVATE)
-        val all = tts.arabicVoices()
-        val offline = all.filter { !it.isNetworkConnectionRequired }
         val out = ArrayList<Voices.PhoneVoice>()
-        for (v in (if (offline.isNotEmpty()) offline else all).take(10)) {
-            var f0 = prefs.getFloat("f0_" + v.name, -1f).toDouble()
-            if (f0 < 0) {
-                tts.select(v.name, 1f)
-                f0 = if (tts.toFile("مرحبًا، كيف حالك اليوم؟ أنا بخير، والحمد لله.", 1f, clip)) {
-                    val s = readWav(clip)
-                    Voices.pitch(FloatArray(s.size) { s[it] / 32768f }, OUT_SR)
-                } else 0.0
-                if (f0 <= 0) continue
-                prefs.edit().putFloat("f0_" + v.name, f0.toFloat()).apply()
+        val byIdentity = tts.arabicVoices().groupBy { it.name.removeSuffix("-network").removeSuffix("-local") }
+        for ((_, variants) in byIdentity) {
+            if (out.size >= 12) break
+            for (v in variants.sortedBy { if (it.isNetworkConnectionRequired) 0 else 1 }) {
+                var f0 = prefs.getFloat("f0_" + v.name, -1f).toDouble()
+                if (v.isNetworkConnectionRequired || f0 < 0) {
+                    tts.select(v.name, 1f)
+                    if (!tts.toFile("مرحبًا، كيف حالك اليوم؟ أنا بخير، والحمد لله.", 1f, clip)) continue   // offline: try the next
+                    if (f0 < 0) {
+                        val pcm = readWav(clip)
+                        f0 = Voices.pitch(FloatArray(pcm.size) { pcm[it] / 32768f }, OUT_SR)
+                        if (f0 <= 0) continue
+                        prefs.edit().putFloat("f0_" + v.name, f0.toFloat()).apply()
+                    }
+                }
+                out.add(Voices.PhoneVoice(v.name, f0))
+                break
             }
-            out.add(Voices.PhoneVoice(v.name, f0))
         }
         return out
+    }
+
+    /** "رجال: 3 • نساء: 2 • أطفال: 1" for the characters that were dubbed. */
+    private fun cast(lines: List<Line>): String {
+        val kinds = lines.filter { it.ar.isNotBlank() }.groupBy { it.spk.coerceAtLeast(0) }.values.map { mine ->
+            Voices.kindOfCharacter(mine.map { it.sex }, mine.map { (it.t1 - it.t0) / 1000.0 }, mine.map { it.f0 })
+        }
+        val parts = ArrayList<String>()
+        val men = kinds.count { it == Voices.Kind.MALE }
+        val women = kinds.count { it == Voices.Kind.FEMALE }
+        val kids = kinds.count { it == Voices.Kind.CHILD }
+        if (men > 0) parts += "رجال: $men"
+        if (women > 0) parts += "نساء: $women"
+        if (kids > 0) parts += "أطفال: $kids"
+        return parts.joinToString(" • ")
     }
 
     /** Builds the Arabic track; returns the time spans (ms) of the lines that were dubbed. */
@@ -538,11 +630,18 @@ object FreeDub {
             val speakers = lines.map { it.spk.coerceAtLeast(0) }.distinct().map { id ->
                 val mine = lines.filter { it.spk.coerceAtLeast(0) == id }
                 val f0s = mine.map { it.f0 }.filter { it > 0 }.sorted()
-                Voices.Speaker(id, if (f0s.isEmpty()) 0.0 else f0s[f0s.size / 2], mine.sumOf { (it.t1 - it.t0) / 1000.0 })
+                val kind = Voices.kindOfCharacter(mine.map { it.sex }, mine.map { (it.t1 - it.t0) / 1000.0 }, mine.map { it.f0 })
+                Voices.Speaker(id, if (f0s.isEmpty()) 0.0 else f0s[f0s.size / 2], mine.sumOf { (it.t1 - it.t0) / 1000.0 }, kind)
             }
+            val characterF0 = speakers.associate { it.id to it.f0 }
+            val missing = speakers.map { it.kind == Voices.Kind.MALE }.distinct().filter { want ->
+                phone.none { (it.kind == Voices.Kind.MALE) == want }
+            }
+            if (missing.isNotEmpty()) j.status = if (missing.first()) "لا يوجد صوت رجل عربي في هاتفك: سيُستعمل صوت امرأة بطبقة أخفض"
+                else "لا يوجد صوت امرأة عربي في هاتفك: سيُستعمل صوت رجل بطبقة أعلى"
             val picks = if (phone.isEmpty()) emptyMap() else Voices.assign(speakers, phone, j.voiceName)
             if (picks.isEmpty()) tts.use(j.voiceName)
-            j.status = if (picks.size > 1) "تسجيل أصوات الشخصيات (${picks.size} أصوات)…" else "تسجيل الصوت العربي…"
+            if (missing.isEmpty()) j.status = if (picks.size > 1) "تسجيل أصوات الشخصيات (${cast(lines).ifEmpty { "${picks.size}" }})…" else "تسجيل الصوت العربي…"
 
             val totalMs = max(j.durationMs, (lines.lastOrNull()?.t1 ?: 0L) + 2000)
             val totalSamples = totalMs * OUT_SR / 1000
@@ -558,17 +657,26 @@ object FreeDub {
                         if (l.ar.isBlank()) continue
                         val text = l.ar
                         val pick = picks[l.spk.coerceAtLeast(0)]
-                        if (pick != null) tts.select(pick.voice, pick.pitch)
+                        // the character's voice, following the actor's intonation on this line a little
+                        val tone = Voices.lineIntonation(l.f0, characterF0[l.spk.coerceAtLeast(0)] ?: 0.0)
+                        if (pick != null) tts.select(pick.voice, (pick.pitch * tone).coerceIn(0.5f, 2f))
                         val baseRate = pick?.rate ?: 1f
                         val next = if (i + 1 < lines.size) lines[i + 1].t0 else totalMs
                         val start = max(l.t0, prevEnd + 60)
                         val allowed = max(600L, max(l.t1, next - 120) - start)   // may run into the following pause
-                        if (!tts.toFile(text, baseRate, clip)) continue
+                        if (!tts.toFile(text, baseRate, clip)) {
+                            // an online voice that lost the connection: its offline twin
+                            if (pick == null || !pick.voice.endsWith("-network")) continue
+                            val twin = pick.voice.replace("-network", "-local")
+                            if (tts.arabicVoices().none { it.name == twin }) continue
+                            tts.select(twin, (pick.pitch * tone).coerceIn(0.5f, 2f))
+                            if (!tts.toFile(text, baseRate, clip)) continue
+                        }
                         var samples = readWav(clip)
                         var dur = samples.size * 1000L / OUT_SR
                         if (dur > allowed) {
-                            // too long for its slot: speak faster (natural up to ~1.7x)
-                            val rate = min(1.75f, baseRate * dur.toFloat() / allowed * 1.05f)
+                            // too long for its slot: speak faster, but never so fast that it sounds like a machine
+                            val rate = min(1.45f, baseRate * dur.toFloat() / allowed * 1.05f)
                             if (tts.toFile(text, rate, clip)) { samples = readWav(clip); dur = samples.size * 1000L / OUT_SR }
                         }
                         if (matchLoudness) matchLevel(samples, readPcm(orig, l.t0, l.t1))
@@ -670,8 +778,11 @@ object FreeDub {
 
     private fun writeLines(f: File, lines: List<Line>) {
         val arr = JSONArray()
-        for (l in lines) arr.put(JSONObject().put("a", l.t0).put("b", l.t1).put("t", l.text).put("ar", l.ar)
-            .put("s", l.spk).put("f", l.f0))
+        for (l in lines) {
+            val o = JSONObject().put("a", l.t0).put("b", l.t1).put("t", l.text).put("ar", l.ar).put("s", l.spk).put("f", l.f0)
+            l.sex?.let { g -> o.put("g", JSONArray().apply { g.forEach { put(it.toDouble()) } }) }
+            arr.put(o)
+        }
         f.writeText(arr.toString())
     }
 
@@ -679,7 +790,9 @@ object FreeDub {
         val arr = JSONArray(f.readText())
         (0 until arr.length()).map {
             val o = arr.getJSONObject(it)
-            Line(o.getLong("a"), o.getLong("b"), o.getString("t"), o.optString("ar"), o.optInt("s", -1), o.optDouble("f", 0.0))
+            val g = o.optJSONArray("g")
+            Line(o.getLong("a"), o.getLong("b"), o.getString("t"), o.optString("ar"), o.optInt("s", -1), o.optDouble("f", 0.0),
+                if (g != null && g.length() == 4) FloatArray(4) { k -> g.getDouble(k).toFloat() } else null)
         }
     }.getOrDefault(emptyList())
 

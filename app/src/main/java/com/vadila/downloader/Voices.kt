@@ -58,37 +58,58 @@ object Voices {
      * Speakers for the phone engine, where every group gets its own synthetic voice: a character split in two
      * would change voice in the middle of the film, which is worse than two minor characters sharing a voice.
      * So the grouping is looser (calibrated on CAM++ fingerprints against pyannote diarization), and a group
-     * that mixes clearly male and clearly female lines is split again.
+     * that mixes lines a trained classifier hears clearly as a man with lines it hears clearly as a woman is
+     * split again. [sex] per line: [speech, man, woman, child] probabilities (AudioSet), or null.
      */
-    fun speakers(embs: List<FloatArray?>, durs: DoubleArray, starts: DoubleArray, pitches: DoubleArray): IntArray {
+    fun speakers(embs: List<FloatArray?>, durs: DoubleArray, starts: DoubleArray, sex: List<FloatArray?>): IntArray {
         val lab = cluster(embs, durs, starts, threshold = 0.75, attach = 0.35)
         var next = (lab.maxOrNull() ?: -1) + 1
+        fun isMan(i: Int) = sex[i]?.let { it[1] > 0.3f && it[1] > 3 * it[2] } ?: false
+        fun isWoman(i: Int) = sex[i]?.let { it[2] > 0.3f && it[2] > 3 * it[1] } ?: false
         for (g in lab.toSet()) {
             val members = lab.indices.filter { lab[it] == g }
-            val low = members.filter { pitches[it] in 1.0..150.0 }
-            val high = members.filter { pitches[it] >= 180.0 }
-            val decisive = low.size + high.size
-            if (low.size < 2 || high.size < 2 || low.size < decisive / 4 || high.size < decisive / 4) continue
-            // mixed group: men and women merged by mistake → split by voice type
-            val lowC = normalize(meanOf(low.mapNotNull { embs[it] }.map { normalize(it) }) ?: continue)
-            val highC = normalize(meanOf(high.mapNotNull { embs[it] }.map { normalize(it) }) ?: continue)
+            val men = members.filter { isMan(it) }
+            val women = members.filter { isWoman(it) }
+            val decisive = men.size + women.size
+            if (men.size < 2 || women.size < 2 || men.size < decisive / 4 || women.size < decisive / 4) continue
+            // a man and a woman merged by mistake → split, undecided lines go to the closer voice
+            val mc = normalize(meanOf(men.mapNotNull { embs[it] }.map { normalize(it) }) ?: continue)
+            val wc = normalize(meanOf(women.mapNotNull { embs[it] }.map { normalize(it) }) ?: continue)
             for (i in members) {
-                val p = pitches[i]
-                val toHigh = when {
-                    p >= 180.0 -> true
-                    p in 1.0..150.0 -> false
-                    embs[i] != null -> dot(normalize(embs[i]!!), highC) > dot(normalize(embs[i]!!), lowC)
+                val toWoman = when {
+                    isWoman(i) -> true
+                    isMan(i) -> false
+                    embs[i] != null -> dot(normalize(embs[i]!!), wc) > dot(normalize(embs[i]!!), mc)
                     else -> false
                 }
-                if (toHigh) lab[i] = next
+                if (toWoman) lab[i] = next
             }
             next++
         }
-        // renumber by amount of speech
         val total = HashMap<Int, Double>()
         for (i in lab.indices) total[lab[i]] = (total[lab[i]] ?: 0.0) + durs[i]
         val remap = total.keys.sortedByDescending { total[it] }.withIndex().associate { it.value to it.index }
         return IntArray(lab.size) { remap.getValue(lab[it]) }
+    }
+
+    /**
+     * Man, woman or child for one character, from all of his/her lines: the trained classifier decides
+     * (it is right where pitch fails, e.g. a man shouting at 250 Hz); pitch only helps to spot children,
+     * whom the classifier often hears as women.
+     * [sex]: [speech, man, woman, child] per line (null = unknown); [f0]: pitch per line (0 = unknown).
+     */
+    fun kindOfCharacter(sex: List<FloatArray?>, durs: List<Double>, f0: List<Double>): Kind {
+        var m = 0.0; var w = 0.0; var c = 0.0; var total = 0.0
+        for (i in sex.indices) {
+            val p = sex[i] ?: continue
+            val d = durs[i]
+            m += d * p[1]; w += d * p[2]; c += d * p[3]; total += d
+        }
+        val pitches = f0.filter { it > 0 }.sorted()
+        val med = if (pitches.isEmpty()) 0.0 else pitches[pitches.size / 2]
+        if (total <= 0 || m + w + c < 0.05 * total) return kindOf(med)          // classifier unsure: use pitch
+        if (c >= 0.5 * max(m, w) || (med > 290 && w >= m)) return Kind.CHILD
+        return if (m >= w) Kind.MALE else Kind.FEMALE
     }
 
     private fun meanOf(v: List<FloatArray>): FloatArray? = if (v.isEmpty()) null else mean(v)
@@ -160,47 +181,56 @@ object Voices {
     // ------------------------------------------------------------------ pitch (gender)
 
     /**
-     * Median pitch (Hz) of the voiced parts of a 16 kHz clip, or 0 when there is none.
-     * Normalized autocorrelation over 40 ms frames, 70–420 Hz.
+     * Median pitch (Hz) of the voiced parts of a clip, or 0 when there is none.
+     * YIN (cumulative mean normalized difference) over 40 ms frames, 60–500 Hz: it takes the first clear
+     * period, so a man's voice is not read an octave up (which would make him sound like a woman).
      */
     fun pitch(x: FloatArray, sr: Int = 16000): Double {
-        val frame = (0.04 * sr).toInt()
-        val hop = frame / 2
-        val minLag = sr / 420
-        val maxLag = sr / 70
-        if (x.size < frame + maxLag) return 0.0
-        var peak = 0f
-        for (v in x) peak = max(peak, abs(v))
-        if (peak < 1e-4f) return 0.0
-        val found = ArrayList<Double>()
-        var p = 0
-        while (p + frame + maxLag <= x.size) {
+        val w = (0.04 * sr).toInt()
+        val hop = w / 2
+        val minLag = sr / 500
+        val maxLag = sr / 60
+        if (x.size < w + maxLag + 2) return 0.0
+        // energy gate: only the louder, voiced parts of the line
+        val frames = (x.size - w - maxLag - 1) / hop + 1
+        val energy = DoubleArray(frames) { f ->
             var e = 0.0
-            for (i in p until p + frame) e += x[i] * x[i]
-            if (sqrt(e / frame) > peak * 0.05) {
-                var bestLag = -1
-                var bestR = 0.0
-                for (lag in minLag..maxLag) {
-                    var num = 0.0
-                    var e2 = 0.0
-                    for (i in p until p + frame) { num += x[i] * x[i + lag]; e2 += x[i + lag] * x[i + lag] }
-                    val r = num / (sqrt(e * e2) + 1e-12)
-                    if (r > bestR) { bestR = r; bestLag = lag }
-                }
-                // prefer the shortest lag that is almost as good (avoids octave errors)
-                if (bestLag > 0 && bestR > 0.6) {
-                    var lag = bestLag
-                    for (div in 2..4) {
-                        val l2 = bestLag / div
-                        if (l2 < minLag) break
-                        var num = 0.0; var e2 = 0.0
-                        for (i in p until p + frame) { num += x[i] * x[i + l2]; e2 += x[i + l2] * x[i + l2] }
-                        if (num / (sqrt(e * e2) + 1e-12) > bestR * 0.92) lag = l2
-                    }
-                    found.add(sr.toDouble() / lag)
-                }
+            val p = f * hop
+            for (i in p until p + w) e += x[i] * x[i]
+            sqrt(e / w)
+        }
+        val gate = (energy.maxOrNull() ?: 0.0) * 0.1
+        if (gate <= 1e-5) return 0.0
+        val d = DoubleArray(maxLag + 2)
+        val found = ArrayList<Double>()
+        for (f in 0 until frames) {
+            if (energy[f] < gate) continue
+            val p = f * hop
+            for (tau in 1..maxLag + 1) {
+                var s2 = 0.0
+                for (j in p until p + w) { val v = x[j] - x[j + tau]; s2 += v * v }
+                d[tau] = s2
             }
-            p += hop
+            // cumulative mean normalized difference
+            var run = 0.0
+            val cm = DoubleArray(maxLag + 2) { 1.0 }
+            for (tau in 1..maxLag + 1) { run += d[tau]; cm[tau] = if (run > 0) d[tau] * tau / run else 1.0 }
+            var tau = -1
+            var t = minLag
+            while (t <= maxLag) {
+                if (cm[t] < 0.15) {
+                    while (t + 1 <= maxLag && cm[t + 1] < cm[t]) t++
+                    tau = t
+                    break
+                }
+                t++
+            }
+            if (tau < 0) continue                       // no clear period: unvoiced frame
+            // parabolic interpolation for a finer period
+            val a = cm[tau - 1]; val b = cm[tau]; val c = cm[tau + 1]
+            val den = a - 2 * b + c
+            val shift = if (abs(den) > 1e-12) (0.5 * (a - c) / den).coerceIn(-1.0, 1.0) else 0.0
+            found.add(sr / (tau + shift))
         }
         if (found.size < 3) return 0.0
         found.sort()
@@ -218,8 +248,8 @@ object Voices {
 
     // ------------------------------------------------------------------ voices
 
-    class Speaker(val id: Int, val f0: Double, val seconds: Double)
-    class PhoneVoice(val name: String, val f0: Double)
+    class Speaker(val id: Int, val f0: Double, val seconds: Double, val kind: Kind = kindOf(f0))
+    class PhoneVoice(val name: String, val f0: Double, val kind: Kind = kindOf(f0))
     class Pick(val voice: String, val pitch: Float, val rate: Float)
 
     /**
@@ -231,21 +261,22 @@ object Voices {
     fun assign(speakers: List<Speaker>, voices: List<PhoneVoice>, preferred: String = ""): Map<Int, Pick> {
         val out = LinkedHashMap<Int, Pick>()
         if (voices.isEmpty()) return out
-        val male = voices.filter { kindOf(it.f0) == Kind.MALE }
-        val female = voices.filter { kindOf(it.f0) != Kind.MALE }
+        val male = voices.filter { it.kind == Kind.MALE }
+        val female = voices.filter { it.kind != Kind.MALE }
         val shifts = listOf(1.0f, 0.88f, 1.12f, 0.8f, 1.22f, 0.94f, 1.06f, 0.74f, 1.3f)
         val used = HashMap<String, MutableList<Float>>()       // voice → pitches already given to characters
         for (s in speakers.sortedByDescending { it.seconds }) {
-            val kind = kindOf(s.f0)
+            val kind = s.kind
             val pool = if (kind == Kind.MALE) male else female
             val (cands, cross) = if (pool.isNotEmpty()) pool to false else voices to true
             val chosen = (if (out.isEmpty() && preferred.isNotEmpty()) cands.firstOrNull { it.name == preferred } else null)
                 ?: cands.minByOrNull { (used[it.name]?.size ?: 0) * 1000 + abs(it.f0 - (if (s.f0 > 0) s.f0 else it.f0)) }!!
             val taken = used.getOrPut(chosen.name) { mutableListOf() }
             // follow the actor's own pitch a little
-            var base = if (s.f0 > 0 && chosen.f0 > 0) sqrt(s.f0 / chosen.f0).toFloat().coerceIn(0.85f, 1.2f) else 1f
+            val sameRegister = s.f0 > 0 && chosen.f0 > 0 && kindOf(s.f0) == chosen.kind
+            var base = if (sameRegister) sqrt(s.f0 / chosen.f0).toFloat().coerceIn(0.9f, 1.12f) else 1f
             if (cross) base *= if (kind == Kind.MALE) 0.72f else 1.35f      // no voice of that gender on the phone
-            if (kind == Kind.CHILD) base *= 1.18f
+            if (kind == Kind.CHILD) base *= 1.3f                                // a child: higher and a bit faster
             val (lo, hi) = when {
                 cross && kind == Kind.MALE -> 0.55f to 0.92f
                 cross -> 1.1f to 1.8f
@@ -256,11 +287,18 @@ object Voices {
             val options = shifts.map { (base * it).coerceIn(lo, hi) }
             val pitch = options.firstOrNull { p -> taken.all { abs(it - p) >= 0.07f } }
                 ?: options.maxByOrNull { p -> taken.minOfOrNull { abs(it - p) } ?: 1f }!!
-            val rate = when (taken.size) { 0 -> 1f; 1 -> 1.05f; 2 -> 0.95f; else -> if (taken.size % 2 == 1) 1.08f else 0.92f }
+            var rate = when (taken.size) { 0 -> 1f; 1 -> 1.05f; 2 -> 0.95f; else -> if (taken.size % 2 == 1) 1.08f else 0.92f }
+            if (kind == Kind.CHILD) rate *= 1.06f
             taken.add(pitch)
             out[s.id] = Pick(chosen.name, pitch, rate)
         }
         return out
+    }
+
+    /** Pitch factor for one line: follows the actor's own intonation on that line, gently (±10 %). */
+    fun lineIntonation(lineF0: Double, characterF0: Double): Float {
+        if (lineF0 <= 0 || characterF0 <= 0) return 1f
+        return Math.pow(lineF0 / characterF0, 0.35).toFloat().coerceIn(0.92f, 1.1f)
     }
 
     // ------------------------------------------------------------------ small vector helpers

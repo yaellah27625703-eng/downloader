@@ -337,7 +337,7 @@ object Dub {
         j.resultName = "$base.${out.extension}"
         j.resultUri = Engine.publishFile(j.resultName, j.resultMime, out).toString()
         j.stage = DubStage.DONE
-        j.status = "اكتملت الدبلجة"
+        j.status = "اكتملت الدبلجة" + (if (res.cast.isNotEmpty()) " • " + res.cast else "")
         j.progress = 100f
         dir.deleteRecursively()
     }
@@ -351,7 +351,8 @@ object Dub {
         // and the Arabic voices (already as loud as the original lines).
         val bed = "[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo[bg];" +
             "[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[rv];" +
-            "[3:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,highpass=f=70[v];" +
+            // a touch of room (two faint early reflections) so the voices sit in the scene instead of on top of it
+            "[3:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,highpass=f=70,aecho=1.0:1.0:17|31:0.12|0.07[v];" +
             "[bg][rv][v]amix=inputs=3:duration=first:normalize=0"
         val filmLimited = "$bed,alimiter=limit=0.89:attack=5:release=60:level=0[mix]"
         val filmPlain = "$bed,volume=0.9[mix]"
