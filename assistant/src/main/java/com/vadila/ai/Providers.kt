@@ -64,7 +64,7 @@ class Out(private val onDelta: (Delta) -> Unit) {
 // Google Gemini
 // =================================================================================================
 object GeminiApi {
-    const val BASE = "https://generativelanguage.googleapis.com"
+    val BASE: String get() = Prefs.get("dev_base_gemini").ifBlank { "https://generativelanguage.googleapis.com" }
     private const val INLINE_MAX = 14L * 1024 * 1024
     val YT = Regex("""https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)[\w\-]{6,}[^\s)]*""")
 
@@ -275,7 +275,7 @@ object GeminiApi {
 // Anthropic Claude
 // =================================================================================================
 object ClaudeApi {
-    const val URL = "https://api.anthropic.com/v1"
+    val URL: String get() = Prefs.get("dev_base_anthropic").ifBlank { "https://api.anthropic.com" } + "/v1"
     private val IMG = setOf("image/jpeg", "image/png", "image/gif", "image/webp")
 
     fun headers() = mapOf("x-api-key" to Prefs.key("anthropic"), "anthropic-version" to "2023-06-01")

@@ -45,9 +45,10 @@ object Prefs {
 - عند تحليل الصور والفيديو والصوت والمستندات صِف ما تراه بدقة ثم أجب عن السؤال.
 - نسّق الإجابات بـ Markdown (عناوين قصيرة، قوائم، جداول عند الحاجة، كتل كود).
 - عند طلب برنامج أو تطبيق: اكتب مشروعًا كاملًا جاهزًا للبناء، وقبل كل ملف اكتب سطرًا بصيغة `FILE: المسار/اسم_الملف` ثم الملف كاملًا داخل كتلة كود، بلا اختصار ولا «...».
-  • أندرويد: Kotlin مع Gradle Kotlin DSL (AGP 8.7.3، Kotlin 2.0.21، compileSdk 35، minSdk 24) دون ملفات gradle-wrapper الثنائية.
-  • لعدة أنظمة (أندرويد وآيفون وويندوز ولينكس): Flutter.
-  • أدوات سطح المكتب: Python. • المواقع: HTML وCSS وJavaScript.
+  • أندرويد: Kotlin مع Gradle Kotlin DSL (AGP 8.7.3، Kotlin 2.0.21، compileSdk 35، minSdk 24، Java 17) دون ملفات gradle-wrapper الثنائية؛
+    واكتب settings.gradle.kts كاملًا (pluginManagement وdependencyResolutionManagement مع google() وmavenCentral())، وgradle.properties فيه android.useAndroidX=true.
+  • لعدة أنظمة (أندرويد وآيفون وويندوز ولينكس): Flutter؛ اكتب pubspec.yaml ومجلد lib/ فقط (مجلدات الأنظمة تُولَّد تلقائيًا عند البناء).
+  • أدوات سطح المكتب: Python بملف main.py وrequirements.txt. • المواقع: index.html مع CSS وJavaScript.
 - اجعل الإجابة متناسبة مع السؤال: قصيرة للأسئلة البسيطة، ومفصلة للمهام الكبيرة.
 """.trim()
 
