@@ -63,7 +63,7 @@ jobs:
           find assistant/build -name "R.jar" -exec cp {} kit/R.jar \; || true
           cp compile.log kit/ || true
           ls -la kit
-          cd kit && zip -q ../devkit.zip *
+          cd kit && zip -qr ../devkit.zip .
 
       - uses: softprops/action-gh-release@v2
         with:

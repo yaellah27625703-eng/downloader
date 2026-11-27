@@ -5,6 +5,7 @@ on:
     paths-ignore:
       - "assistant/**"
       - ".github/workflows/assistant.yml"
+      - ".github/workflows/devkit.yml"
   workflow_dispatch:
 
 permissions:
