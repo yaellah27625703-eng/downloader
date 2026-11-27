@@ -86,12 +86,17 @@ object Router {
             brainsOf("openrouter", 3) + brainsOf("custom", 1) + brainsOf("pollinations", 2) + brainsOf("free", 1)).distinctBy { it.id }
     }
 
+    /** Models usable without internet: your own server on the home network, then the one inside the phone. */
+    fun offlineChain(): List<Brain> = brainsOf("custom", 1) + brainsOf("device", 3)
+
     fun autoChain(): List<Brain> {
+        if (!OnDevice.online()) return offlineChain()
         val g = brainsOf("gemini", 7)
         val gTop = g.filter { !it.model.contains("lite") && !it.model.startsWith("gemma") }
         val gRest = g.filter { it !in gTop }
         val list = ArrayList<Brain>()
         if (Prefs.bool("custom_first")) list += brainsOf("custom", 1)
+        if (Prefs.bool("device_first")) list += brainsOf("device", 1)
         list += brainsOf("anthropic", 2)
         list += brainsOf("openai", 2)
         list += gTop.take(1)
@@ -109,6 +114,7 @@ object Router {
         list += brainsOf("cerebras", 2).drop(1)
         list += brainsOf("custom", 1)
         list += brainsOf("pollinations", 2)
+        list += brainsOf("device", 3)
         list += brainsOf("free", 2)
         return list.distinctBy { it.id }
     }
@@ -124,6 +130,7 @@ object Router {
     /** brain choice from the chips: auto | claude | gpt | gemini | council | <providerId:model> */
     fun chainFor(choice: String): List<Brain> = when (choice) {
         "auto", "council", "" -> autoChain()
+        "device" -> brainsOf("device", 3).ifEmpty { autoChain() }
         "claude", "gpt", "gemini" -> familyChain(choice)
         else -> {
             val pid = choice.substringBefore(':')
@@ -209,7 +216,10 @@ object Router {
     /** Tries each brain of [chain] until one answers. */
     fun run(chain0: List<Brain>, req: Req, cancel: Cancel, status: (String) -> Unit, onDelta: (Brain, Delta) -> Unit): Result {
         val chain = sortForInput(chain0, req)
-        if (chain.isEmpty()) throw ApiError(Kind.GONE, 0, "لا يوجد نموذج متاح — أضف مفتاحًا في الإعدادات.")
+        if (chain.isEmpty()) {
+            if (!OnDevice.online()) throw ApiError(Kind.NETWORK, 0, "لا يوجد اتصال بالإنترنت. نزّل نموذج «بلا إنترنت» من الإعدادات ليعمل التطبيق دون اتصال.")
+            throw ApiError(Kind.GONE, 0, "لا يوجد نموذج متاح — أضف مفتاحًا في الإعدادات.")
+        }
         val coolKey = { b: Brain -> if (req.search) "search:" + b.id else b.id }
         var candidates = chain.filter { !cooling(it.id) && !cooling(coolKey(it)) }
         if (candidates.isEmpty()) candidates = chain.sortedBy { maxOf(coolUntil(it.id), coolUntil(coolKey(it))) }.take(2)
@@ -249,6 +259,10 @@ object Router {
 
     /** Answers with web search: native search tools first, then a Wikipedia-based fallback. */
     fun runSearch(chain0: List<Brain>, req: Req, cancel: Cancel, status: (String) -> Unit, onDelta: (Brain, Delta) -> Unit): Result {
+        if (!OnDevice.online()) {
+            status("لا يوجد إنترنت — يجيب دون بحث")
+            return run(offlineChain(), req, cancel, status, onDelta)
+        }
         val searchers = ArrayList<Brain>()
         searchers += chain0.filter { it.p.id == "anthropic" }.take(1)
         searchers += chain0.filter { it.p.id == "gemini" }
@@ -278,6 +292,7 @@ object Router {
 
     /** Asks Claude, ChatGPT and Gemini (whichever are set up) in parallel, then merges their answers. */
     fun runCouncil(req: Req, cancel: Cancel, status: (String) -> Unit, onDelta: (Brain, Delta) -> Unit): Result {
+        if (!OnDevice.online()) return run(offlineChain(), req, cancel, status, onDelta)
         val members = ArrayList<Pair<String, List<Brain>>>()
         for ((fam, name) in listOf("claude" to "Claude", "gpt" to "ChatGPT", "gemini" to "Gemini")) {
             val c = familyChain(fam)

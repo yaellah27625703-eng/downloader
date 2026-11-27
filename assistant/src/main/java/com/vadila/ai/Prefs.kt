@@ -23,6 +23,7 @@ object Prefs {
     fun hasKey(provider: String): Boolean = when (provider) {
         "free" -> !bool("free_off", false)
         "custom" -> get("base_custom").isNotBlank()
+        "device" -> OnDevice.installedModels().isNotEmpty()
         else -> key(provider).isNotEmpty()
     }
 
@@ -73,6 +74,7 @@ class ProviderDef(
         const val GEMINI = 1
         const val CLAUDE = 2
         const val OAI = 3
+        const val DEVICE = 4
     }
 }
 
@@ -153,6 +155,12 @@ object Catalog {
             keyHint = "المفتاح (اختياري)",
         ),
         ProviderDef(
+            "device", "داخل الهاتف (بلا إنترنت)", "other", ProviderDef.DEVICE, "",
+            "", true,
+            "نموذج Gemma 4 من Google يعمل داخل هاتفك دون إنترنت ودون مفتاح أو حساب، ويفهم الصور والصوت.",
+            listOf("gemma-4-e2b"),
+        ),
+        ProviderDef(
             "free", "مجاني بلا مفتاح", "other", ProviderDef.OAI, "https://text.pollinations.ai/openai",
             "", true,
             "نموذج مفتوح المصدر صغير يعمل فورًا دون تسجيل (أبطأ وأضعف). يُستعمل كآخر احتياط.",
@@ -166,6 +174,10 @@ object Catalog {
 
     /** Preferred model first, then the defaults, then whatever was fetched. */
     fun modelsFor(p: ProviderDef, max: Int = 4): List<String> {
+        if (p.id == "device") {
+            val first = OnDevice.preferred()
+            return (listOfNotNull(first) + OnDevice.installedModels()).distinct().map { it.id }.take(max)
+        }
         val out = LinkedHashSet<String>()
         Prefs.get("model_${p.id}").takeIf { it.isNotBlank() }?.let { out.add(it) }
         val fetched = Prefs.models(p.id)
@@ -188,6 +200,7 @@ object Catalog {
         return when (p.id) {
             "gemini" -> VISION or PDF or AUDIO or VIDEO or SEARCH
             "anthropic" -> VISION or PDF or SEARCH
+            "device" -> if (OnDevice.byId(model)?.multimodal == true) VISION or PDF or AUDIO or VIDEO else 0
             "openai" -> if (m.startsWith("gpt-") || m.startsWith("o") || m.contains("chat")) VISION or PDF else 0
             "github" -> if (m in Prefs.tagged("github", "vision") || m.contains("gpt-4o") || m.contains("gpt-4.1") ||
                 m.contains("gpt-5") || m.contains("llama-4") || m.contains("multimodal") || m.contains("vision")) VISION else 0
@@ -205,6 +218,7 @@ object Catalog {
 
     /** Short display name of a model. */
     fun pretty(model: String): String {
+        OnDevice.byId(model)?.let { return it.name + " (بلا إنترنت)" }
         var m = model.substringAfterLast('/').removeSuffix(":free")
         m = m.replace("-latest", "").replace("-preview", " (تجريبي)")
         return when {

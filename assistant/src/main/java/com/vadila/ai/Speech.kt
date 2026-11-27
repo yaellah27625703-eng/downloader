@@ -38,7 +38,8 @@ class Dictation(
             return
         }
         stop()
-        val r = SpeechRecognizer.createSpeechRecognizer(ctx)
+        val r = if (!OnDevice.online() && android.os.Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(ctx))
+            SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx) else SpeechRecognizer.createSpeechRecognizer(ctx)
         sr = r
         r.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
@@ -284,7 +285,7 @@ object Speaker {
         if (clean.isBlank()) return
         speakingId = id
         main.post { onChange?.invoke() }
-        val natural = Prefs.get("voice_engine", "gemini") == "gemini" && Prefs.hasKey("gemini")
+        val natural = Prefs.get("voice_engine", "gemini") == "gemini" && Prefs.hasKey("gemini") && OnDevice.online()
         if (natural) speakGemini(ctx, clean) else speakPhone(clean)
     }
 

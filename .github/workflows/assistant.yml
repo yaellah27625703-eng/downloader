@@ -27,7 +27,7 @@ jobs:
         run: |
           chmod +x gradlew
           set -o pipefail
-          ./gradlew :assistant:assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          ./gradlew -p assistant assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
           cp assistant/build/outputs/apk/release/*.apk VadilaAI.apk
           ls -la VadilaAI.apk
 

@@ -70,7 +70,7 @@ class CallActivity : Activity() {
         window.statusBarColor = 0xFF0B0A14.toInt()
         window.navigationBarColor = 0xFF0B0A14.toInt()
         build()
-        classic = !Prefs.hasKey("gemini")
+        classic = !Prefs.hasKey("gemini") || !OnDevice.online()
         if (classic) startClassic() else startLive()
         tick()
     }

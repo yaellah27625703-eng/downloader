@@ -38,6 +38,7 @@ class Brain(val p: ProviderDef, val model: String) {
             "github" -> 14_000
             "groq" -> if (model.contains("compound")) 12_000 else 18_000
             "custom" -> 24_000
+            "device" -> 7_000
             else -> 12_000
         }
 }
@@ -522,10 +523,12 @@ object Api {
     fun chat(b: Brain, req: Req, out: Out, cancel: Cancel) = when (b.p.api) {
         ProviderDef.GEMINI -> GeminiApi.chat(b, req, out, cancel)
         ProviderDef.CLAUDE -> ClaudeApi.chat(b, req, out, cancel)
+        ProviderDef.DEVICE -> OnDevice.chat(b, req, out, cancel) { s -> out.add(Delta().also { it.status = s }) }
         else -> OaiApi.chat(b, req, out, cancel)
     }
 
     fun listModels(p: ProviderDef): List<String> = when (p.api) {
+        ProviderDef.DEVICE -> OnDevice.installedModels().map { it.id }
         ProviderDef.GEMINI -> GeminiApi.listModels()
         ProviderDef.CLAUDE -> ClaudeApi.listModels()
         else -> OaiApi.listModels(p)

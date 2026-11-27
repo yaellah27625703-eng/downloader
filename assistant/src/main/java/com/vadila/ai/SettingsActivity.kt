@@ -1,6 +1,9 @@
 package com.vadila.ai
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -11,6 +14,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.File
 import java.util.concurrent.Executors
 
 class SettingsActivity : Activity() {
@@ -55,9 +59,12 @@ class SettingsActivity : Activity() {
         root.addView(scroll, Ui.lp(Ui.MATCH, 0, 1f))
         setContentView(root)
 
+        deviceSection()
+
         section("المفاتيح")
         note("كل خدمة تحتاج مفتاحًا (API key) خاصًا بها. ابدأ بالمجانية: Gemini ثم Groq ثم GitHub. عندما تنتهي حصة خدمة ينتقل التطبيق تلقائيًا إلى التالية، فلا يتوقف عن العمل.")
         val order = listOf("gemini", "groq", "github", "mistral", "openrouter", "cerebras", "pollinations", "anthropic", "openai", "deepseek", "xai", "custom", "free")
+        // (the offline models have their own section above)
         for (id in order) Catalog.byId(id)?.let { providerCard(it) }
 
         section("الصوت والمكالمات")
@@ -111,6 +118,123 @@ class SettingsActivity : Activity() {
         content.addView(Ui.button(this, "فتح المستودع (الكود المصدري)", false, R.drawable.ic_open) {
             Ui.open(this, "https://github.com/yaellah27625703-eng/downloader/tree/main/assistant")
         }, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(8) })
+    }
+
+    // ---- offline models ---------------------------------------------------------------------------
+    private val refreshers = ArrayList<() -> Unit>()
+    private val ticker = object : Runnable {
+        override fun run() {
+            refreshers.forEach { it() }
+            ui.postDelayed(this, 700)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ui.post(ticker)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        ui.removeCallbacks(ticker)
+    }
+
+    private fun deviceSection() {
+        val p = Ui.p
+        section("بلا إنترنت — داخل الهاتف")
+        val head = Ui.card(this)
+        cards["device"] = head
+        head.addView(Ui.text(this, 13.5f, p.text).apply {
+            text = "نموذج مفتوح المصدر من Google (Gemma 4، رخصة Apache-2.0) يعمل داخل هاتفك: بلا إنترنت، بلا مفتاح، بلا حساب، وبلا حدود. " +
+                "يُنزَّل مرة واحدة، ثم يعمل حتى في وضع الطيران. أضعف من Claude وGemini السحابيين، لكنه يفهم الصور والصوت."
+        })
+        head.addView(Ui.text(this, 12.5f, p.sub).apply {
+            text = "ذاكرة هاتفك: %.1f غيغابايت • المساحة الفارغة: %.1f غيغابايت".format(OnDevice.ramGb(), OnDevice.freeBytes() / 1e9)
+            setPadding(0, dp(6), 0, 0)
+        })
+        content.addView(head, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(8) })
+        for (m in OnDevice.MODELS) deviceCard(m)
+        toggle("استعمله أولًا حتى مع وجود الإنترنت (خصوصية تامة)", "device_first", false)
+    }
+
+    private fun deviceCard(m: OnDevice.Model) {
+        val p = Ui.p
+        val card = Ui.card(this)
+        val title = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        title.addView(Ui.text(this, 15.5f, p.text, true).apply { text = m.name + "  —  %.1f غ.ب".format(m.bytes / 1e9) }, Ui.lp(0, Ui.WRAP, 1f))
+        if (m.id == "gemma-4-e2b") title.addView(Ui.text(this, 11.5f, p.success, true).apply {
+            text = "موصى به"
+            background = Ui.rounded(this@SettingsActivity, p.field, 8)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+        })
+        card.addView(title)
+        val ram = OnDevice.ramGb()
+        card.addView(Ui.text(this, 12.5f, if (ram + 0.5 < m.ramGb) p.danger else p.sub).apply {
+            text = m.note + " • يحتاج ذاكرة ${m.ramGb} غيغابايت أو أكثر" + if (ram + 0.5 < m.ramGb) " (ذاكرة هاتفك أقل، قد لا يعمل)" else ""
+            setPadding(0, dp(3), 0, dp(6))
+        })
+        val status = Ui.text(this, 13f, p.sub)
+        val bar = Ui.progress(this).apply { visibility = View.GONE }
+        val btns = LinearLayout(this)
+        card.addView(status)
+        card.addView(bar, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(4) })
+        card.addView(btns, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(6) })
+        var lastState = ""
+        fun refresh() {
+            val downloading = ModelService.running && ModelService.modelId == m.id
+            val state = when {
+                downloading -> "dl"
+                OnDevice.installed(m) -> if (OnDevice.preferred()?.id == m.id) "active" else "installed"
+                File(OnDevice.dir, m.file + ".part").exists() -> "partial"
+                else -> "none"
+            }
+            if (downloading) {
+                val pct = if (ModelService.total > 0) (ModelService.done * 1000 / ModelService.total).toInt() else 0
+                bar.progress = pct
+                status.text = "يُنزَّل… %.1f%% (%.2f من %.2f غ.ب)".format(pct / 10.0, ModelService.done / 1e9, ModelService.total / 1e9)
+            }
+            if (state == lastState) return
+            lastState = state
+            bar.visibility = if (downloading) View.VISIBLE else View.GONE
+            btns.removeAllViews()
+            when (state) {
+                "dl" -> btns.addView(Ui.button(this, "إيقاف التنزيل مؤقتًا", false, R.drawable.ic_stop) { ModelService.cancel() }, Ui.lp(Ui.MATCH, Ui.WRAP))
+                "active", "installed" -> {
+                    status.text = if (state == "active") "✓ مثبّت ومستعمل" else "✓ مثبّت"
+                    status.setTextColor(p.success)
+                    if (state == "installed") btns.addView(Ui.button(this, "استعماله", true, R.drawable.ic_check) {
+                        Prefs.set("model_device", m.id)
+                        OnDevice.release()
+                        lastState = ""
+                    }, Ui.lp(0, Ui.WRAP, 1f).apply { marginEnd = dp(6) })
+                    btns.addView(Ui.button(this, "حذف", false, R.drawable.ic_delete) {
+                        Ui.confirm(this, "حذف ${m.name}", "سيُحذف النموذج من الهاتف ويُحرَّر %.1f غيغابايت.".format(m.bytes / 1e9), "حذف") {
+                            OnDevice.delete(m)
+                            lastState = ""
+                        }
+                    }, Ui.lp(0, Ui.WRAP, 1f))
+                }
+                else -> {
+                    status.text = ModelService.error?.takeIf { ModelService.modelId == m.id }?.let { "✗ $it" }
+                        ?: if (state == "partial") "نُزِّل جزء منه — اضغط للمتابعة" else "غير مثبّت"
+                    status.setTextColor(if (ModelService.error != null && ModelService.modelId == m.id) p.danger else p.sub)
+                    btns.addView(Ui.button(this, if (state == "partial") "متابعة التنزيل" else "تنزيل (%.1f غ.ب)".format(m.bytes / 1e9), true, R.drawable.ic_download) {
+                        if (ModelService.running) return@button Ui.toast(this, "ينتظر انتهاء التنزيل الحالي")
+                        if (OnDevice.freeBytes() < m.bytes + 300_000_000L) return@button Ui.toast(this, "المساحة الفارغة غير كافية")
+                        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 3)
+                        }
+                        if (Prefs.get("model_device").isBlank() || !OnDevice.installed(OnDevice.byId(Prefs.get("model_device")) ?: m)) Prefs.set("model_device", m.id)
+                        ModelService.start(this, m.id)
+                        Ui.toast(this, "بدأ التنزيل في الخلفية؛ يمكنك متابعة استعمال التطبيق")
+                        lastState = ""
+                    }, Ui.lp(Ui.MATCH, Ui.WRAP))
+                }
+            }
+        }
+        refresh()
+        refreshers.add { refresh() }
+        content.addView(card, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(8) })
     }
 
     // ---- building blocks -------------------------------------------------------------------------

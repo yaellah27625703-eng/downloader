@@ -1,6 +1,7 @@
+// The assistant is its own Gradle build (newer Kotlin than the downloader app), built with: ./gradlew -p assistant assembleRelease
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    id("com.android.application") version "8.7.3"
+    id("org.jetbrains.kotlin.android") version "2.4.0"
 }
 
 android {
@@ -38,9 +39,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
 
     packaging {
         resources {
@@ -60,5 +58,11 @@ dependencies {
     // free on-device background removal (Google ML Kit)
     implementation("com.google.android.gms:play-services-mlkit-subject-segmentation:16.0.0-beta1")
     // offline AI inside the phone (Gemma 4 via Google's LiteRT-LM)
-    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.19.1")
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
 }

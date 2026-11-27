@@ -27,7 +27,7 @@ jobs:
         continue-on-error: true
         run: |
           chmod +x gradlew
-          ./gradlew :assistant:compileReleaseKotlin --no-daemon > compile.log 2>&1 || true
+          ./gradlew -p assistant compileReleaseKotlin --no-daemon > compile.log 2>&1 || true
           tail -120 compile.log
 
       - name: LiteRT-LM versions and their Java bytecode level
@@ -61,6 +61,18 @@ jobs:
             cp "$f" "kit/aar-$n.jar"
           done
           find assistant/build -name "R.jar" -exec cp {} kit/R.jar \; || true
+          # the Kotlin 2.4 compiler, to compile-check the code outside Gradle
+          mkdir -p kit/kotlinc
+          for d in org.jetbrains.kotlin org.jetbrains.intellij.deps org.jetbrains.kotlinx org.jetbrains; do
+            find ~/.gradle/caches/modules-2/files-2.1/$d -maxdepth 1 -type d 2>/dev/null
+          done | while read g; do
+            n=$(basename "$g")
+            case "$n" in
+              kotlin-compiler-embeddable|kotlin-stdlib|kotlin-script-runtime|kotlin-reflect|kotlin-daemon-embeddable|trove4j|kotlinx-coroutines-core-jvm|annotations|kotlin-build-tools-api|kotlin-build-tools-impl)
+                find "$g" -name "*.jar" ! -name "*sources*" | grep -E "2\.4\.0|trove4j|kotlinx-coroutines-core-jvm-1\.(8|9|10|11)|annotations-(13|2[0-9])" | while read f; do cp "$f" kit/kotlinc/; done ;;
+            esac
+          done
+          ls kit/kotlinc
           cp compile.log kit/ || true
           ls -la kit
           cd kit && zip -qr ../devkit.zip .

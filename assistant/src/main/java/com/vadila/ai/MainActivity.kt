@@ -237,6 +237,7 @@ class MainActivity : Activity() {
             Triple("gpt", "ChatGPT", null),
             Triple("gemini", "Gemini", null),
             Triple("council", "مجلس الثلاثة", R.drawable.ic_check),
+            Triple("device", "بلا إنترنت", R.drawable.ic_phone),
         )
         for ((id, label, icon) in items) {
             val chip = Ui.chip(this, label, brain == id, icon) { selectBrain(id) }
@@ -255,6 +256,13 @@ class MainActivity : Activity() {
         }
         if (id == "gpt" && Router.familyChain("gpt").isEmpty()) {
             needKey("ChatGPT", "github", "للوصول إلى نماذج ChatGPT مجانًا أضف رمز GitHub (مجاني)، أو مفتاح OpenAI المدفوع.")
+            return
+        }
+        if (id == "device" && !Prefs.hasKey("device")) {
+            AlertDialog.Builder(this).setTitle("بلا إنترنت")
+                .setMessage("نزّل أولًا نموذج Gemma 4 (نحو 2.6 غيغابايت مرة واحدة). بعدها يعمل التطبيق داخل هاتفك دون إنترنت ودون مفتاح أو حساب.")
+                .setPositiveButton("تنزيل النموذج") { _, _ -> openSettings("device") }
+                .setNegativeButton("لاحقًا", null).show()
             return
         }
         if (id == "gemini" && Router.familyChain("gemini").isEmpty()) {
@@ -317,6 +325,7 @@ class MainActivity : Activity() {
             "gpt" -> "ChatGPT"
             "gemini" -> "Gemini"
             "council" -> "Claude + ChatGPT + Gemini"
+            "device" -> "داخل الهاتف — بلا إنترنت"
             else -> Catalog.pretty(brain.substringAfter(':'))
         }
         subTv.text = mode + (if (searchOn) " • بحث في الويب" else "") + (if (imageMode) " • رسم" else "")
@@ -513,6 +522,8 @@ class MainActivity : Activity() {
                 setPadding(0, dp(4), 0, dp(10))
             })
             card.addView(Ui.button(this, "إعداد المفاتيح المجانية", true, R.drawable.ic_key) { openSettings(null) }, Ui.lp(Ui.MATCH, Ui.WRAP))
+            card.addView(Ui.button(this, "أو: تنزيل نموذج يعمل بلا إنترنت ولا مفتاح", false, R.drawable.ic_phone) { openSettings("device") },
+                Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(8) })
             box.addView(card, Ui.lp(Ui.MATCH, Ui.WRAP).apply { topMargin = dp(14) })
         }
         list.addView(box, Ui.lp(Ui.MATCH, Ui.WRAP))
@@ -896,7 +907,7 @@ class MainActivity : Activity() {
                 "لتحليل الصور أضف مفتاح Gemini المجاني من الإعدادات (أو مفتاح Claude أو OpenAI أو رمز GitHub)."
             atts.any { it.isVideo } && !Prefs.hasKey("gemini") && !vision ->
                 "لتحليل الفيديو أضف مفتاح Gemini المجاني من الإعدادات."
-            atts.any { it.isAudio } && !Prefs.hasKey("gemini") && !Prefs.hasKey("groq") ->
+            atts.any { it.isAudio } && !Prefs.hasKey("gemini") && !Prefs.hasKey("groq") && OnDevice.installedModels().none { it.multimodal } ->
                 "لفهم الرسائل والملفات الصوتية أضف مفتاح Gemini أو Groq (كلاهما مجاني) من الإعدادات."
             else -> null
         }
