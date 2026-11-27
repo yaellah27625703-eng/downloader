@@ -93,6 +93,37 @@ object Dub {
     var asrModel: String
         get() = prefs.getString("dubAsr", "base") ?: "base"
         set(v) { prefs.edit().putString("dubAsr", v).apply() }
+    /** Link shown by the Colab notebook: https://xxxx.trycloudflare.com/?k=TOKEN */
+    var colabLink: String
+        get() = prefs.getString("colabLink", "") ?: ""
+        set(v) { prefs.edit().putString("colabLink", v.trim()).apply() }
+    @Volatile var colabGpu = ""
+
+    const val COLAB_NOTEBOOK =
+        "https://colab.research.google.com/github/yaellah27625703-eng/downloader/blob/main/colab/arabic_dub_server.ipynb"
+
+    fun parseColab(text: String): String? =
+        Regex("https://[a-z0-9-]+\\.trycloudflare\\.com/?\\?k=[A-Za-z0-9_-]+").find(text)?.value
+
+    private fun colabEndpoint(): Pair<String, String>? {
+        val link = colabLink.ifBlank { return null }
+        val u = Uri.parse(link)
+        val key = u.getQueryParameter("k") ?: return null
+        return "https://" + u.host to key
+    }
+
+    /** Checks the Colab server; returns the GPU name or throws. */
+    fun checkColab(link: String): String {
+        val u = Uri.parse(link)
+        val key = u.getQueryParameter("k") ?: throw IOException("الرابط غير صحيح")
+        val c = (URL("https://" + u.host + "/health?k=" + key).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 15_000; readTimeout = 20_000
+        }
+        if (c.responseCode != 200) throw IOException("الخادم لا يستجيب (${c.responseCode})")
+        val o = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+        return o.optString("gpu").ifEmpty { "GPU" }
+    }
+
     var keepOriginal: Boolean
         get() = prefs.getBoolean("dubKeepOriginal", true)
         set(v) { prefs.edit().putBoolean("dubKeepOriginal", v).apply() }
@@ -111,7 +142,7 @@ object Dub {
         // The app was closed while dubbing: work already sent to ElevenLabs continues there, so pick it up again.
         for (j in jobs) {
             if (j.stage == DubStage.DONE || j.stage == DubStage.FAILED) continue
-            if (j.engine == "eleven" && j.projectId.isNotEmpty()) launch(j, resume = true)
+            if ((j.engine == "eleven" || j.engine == "colab") && j.projectId.isNotEmpty()) launch(j, resume = true)
             else if (j.engine == "free") launch(j, resume = true)   // continues from the saved transcript
             else { j.stage = DubStage.FAILED; j.error = "توقفت العملية قبل الرفع. اضغط إعادة المحاولة." }
         }
@@ -180,6 +211,7 @@ object Dub {
             val dir = workDir(j).apply { mkdirs() }
             val src = File(dir, "source")
             if (j.engine == "free") { runFree(j, dir, src); return }
+            if (j.engine == "colab") { runColab(j, dir, src); return }
             if (apiKey.isBlank()) throw IOException("أضف مفتاح ElevenLabs من الإعدادات أولًا")
 
             if (!resume || j.projectId.isEmpty()) {
@@ -351,6 +383,140 @@ object Dub {
             if (rc == 0 && out.length() > 0) return out
         }
         throw IOException("تعذّر دمج الصوت العربي مع الفيديو")
+    }
+
+    // ------------------------------------------------------------------ Colab (free GPU, original voices)
+
+    private fun colabUrl(path: String, params: Map<String, String>): URL {
+        val (base, key) = colabEndpoint() ?: throw IOException("اتصل بخادم Colab أولًا من صفحة الدبلجة")
+        val q = StringBuilder("?k=").append(key)
+        for ((k, v) in params) q.append('&').append(k).append('=').append(java.net.URLEncoder.encode(v, "UTF-8"))
+        return URL(base + path + q)
+    }
+
+    private fun colabJson(c: HttpURLConnection): JSONObject {
+        val code = c.responseCode
+        val body = (if (code in 200..299) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() } ?: ""
+        if (code == 403) throw IOException("رابط Colab قديم. انسخ الرابط الجديد من صفحة Colab")
+        if (code == 530 || code == 502 || code == 404 && body.isBlank())
+            throw IOException("خادم Colab متوقف. افتح صفحة Colab وشغّلها، ثم انسخ الرابط الجديد")
+        if (code !in 200..299) throw IOException("خطأ من خادم Colab ($code): " + body.take(200))
+        return JSONObject(body.ifBlank { "{}" })
+    }
+
+    private fun runColab(j: DubJob, dir: File, src: File) {
+        ensureSource(j, src)
+        if (j.projectId.isEmpty()) {
+            // only the audio travels to Colab: much smaller and faster than the whole video
+            j.stage = DubStage.PREPARING
+            j.status = "استخراج الصوت…"
+            j.progress = 0f
+            val audio = File(dir, "colab_in.m4a")
+            val rc = Ffmpeg.run(ctx, listOf("-y", "-i", src.absolutePath, "-vn", "-ac", "2", "-ar", "44100", "-c:a", "aac", "-b:a", "160k", audio.absolutePath),
+                j.durationMs, onProcess = { j.process = it }) { j.progress = it }
+            if (rc != 0 || audio.length() == 0L) throw IOException("تعذّر استخراج صوت الفيديو")
+            check(j)
+
+            j.stage = DubStage.UPLOADING
+            val jobId = "a${j.id}x${System.currentTimeMillis() % 1_000_000}"
+            val chunk = 40L * 1024 * 1024          // stays under the tunnel's request size limit
+            val parts = ((audio.length() + chunk - 1) / chunk).toInt()
+            val buf = ByteArray(256 * 1024)
+            for (part in 0 until parts) {
+                var attempt = 0
+                while (true) {
+                    try {
+                        val off = part * chunk
+                        val len = minOf(chunk, audio.length() - off)
+                        val c = (colabUrl("/upload", mapOf("job" to jobId, "part" to "$part")).openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"; doOutput = true
+                            connectTimeout = 30_000; readTimeout = 120_000
+                            setRequestProperty("Content-Type", "application/octet-stream")
+                            setFixedLengthStreamingMode(len)
+                        }
+                        java.io.RandomAccessFile(audio, "r").use { raf ->
+                            raf.seek(off)
+                            c.outputStream.use { out ->
+                                var left = len
+                                while (left > 0) {
+                                    check(j)
+                                    val n = raf.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                                    if (n < 0) break
+                                    out.write(buf, 0, n)
+                                    left -= n
+                                    j.progress = (off + len - left) * 100f / audio.length()
+                                }
+                            }
+                        }
+                        colabJson(c)
+                        break
+                    } catch (e: IOException) {
+                        if (j.cancelled || ++attempt >= 4) throw e
+                        Thread.sleep(2000L * attempt)
+                    }
+                }
+            }
+            val lang = j.sourceLang.substringBefore('-')
+            val start = (colabUrl("/start", mapOf("job" to jobId, "parts" to "$parts", "lang" to lang, "speakers" to "0"))
+                .openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"; doOutput = true; connectTimeout = 30_000; setFixedLengthStreamingMode(0)
+            }
+            start.outputStream.use { }
+            colabJson(start)
+            j.projectId = jobId
+            save()
+        }
+
+        // follow the work on the Colab GPU
+        j.stage = DubStage.WAITING
+        var failures = 0
+        while (true) {
+            check(j)
+            try {
+                val o = colabJson(colabUrl("/status", mapOf("job" to j.projectId)).openConnection() as HttpURLConnection)
+                failures = 0
+                j.status = o.optString("message").ifBlank { "تجري الدبلجة على Colab…" }
+                j.progress = o.optDouble("progress", -1.0).toFloat()
+                if (o.optBoolean("done")) break
+                val err = o.optString("error").takeIf { it.isNotBlank() && it != "null" }
+                if (o.optString("stage") == "unknown") {
+                    j.projectId = ""
+                    throw IOException("أُعيد تشغيل خادم Colab وضاعت المهمة. اضغط إعادة المحاولة")
+                }
+                if (err != null) { j.projectId = ""; throw IOException("فشلت الدبلجة على Colab: $err") }
+            } catch (e: IOException) {
+                if (j.projectId.isEmpty()) throw e          // the job is lost or failed on the server
+                if (++failures > 40) throw IOException("انقطع الاتصال بخادم Colab. تأكد أن صفحة Colab ما زالت مفتوحة، ثم اضغط إعادة المحاولة")
+            }
+            Thread.sleep(3000)
+        }
+
+        // fetch the Arabic audio + subtitles and put them into the video here on the phone
+        j.stage = DubStage.DOWNLOADING
+        j.status = "تنزيل الصوت العربي…"
+        val dubAudio = File(dir, "colab_dub.m4a")
+        fetch(colabUrl("/result", mapOf("job" to j.projectId, "file" to "audio")).toString(), dubAudio, j)
+        val subs = File(dir, "colab_ar.srt")
+        runCatching { fetch(colabUrl("/result", mapOf("job" to j.projectId, "file" to "srt")).toString(), subs, j) }
+        check(j)
+        j.stage = DubStage.MERGING
+        j.progress = 0f
+        j.status = "دمج الصوت العربي مع الفيديو…"
+        val base = j.name.substringBeforeLast('.').take(100).ifBlank { "video" } + " - مدبلج"
+        if (j.hasVideo) {
+            val out = mux(j, src, dubAudio, subs, dir)
+            j.resultMime = if (out.extension == "mkv") "video/x-matroska" else "video/mp4"
+            j.resultName = "$base.${out.extension}"
+            j.resultUri = Engine.publishFile(j.resultName, j.resultMime, out).toString()
+        } else {
+            j.resultMime = "audio/mp4"
+            j.resultName = "$base.m4a"
+            j.resultUri = Engine.publishFile(j.resultName, j.resultMime, dubAudio).toString()
+        }
+        j.stage = DubStage.DONE
+        j.status = "اكتملت الدبلجة"
+        j.progress = 100f
+        dir.deleteRecursively()
     }
 
     // ------------------------------------------------------------------ ElevenLabs API

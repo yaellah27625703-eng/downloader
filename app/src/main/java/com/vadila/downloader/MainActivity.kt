@@ -195,6 +195,8 @@ class MainActivity : Activity() {
         // Returning from the permission screens: show the floating button / refresh settings.
         if (DownloadService.bubbleAllowed(this)) DownloadService.start(this)
         if (current == 2) settings.rebuild()
+        // back from the Colab page: connect with the copied link
+        if (current == 3 && Dub.engine == "colab") window.decorView.postDelayed({ dub.checkClipboard(manual = false) }, 400)
     }
 
     override fun onPause() {

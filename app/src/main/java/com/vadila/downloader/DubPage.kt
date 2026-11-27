@@ -33,6 +33,8 @@ class DubPage(private val a: MainActivity) {
     val view = ScrollView(a)
     private val body = LinearLayout(a).apply { orientation = LinearLayout.VERTICAL }
     private val keyCard: LinearLayout
+    private val colabCard: LinearLayout
+    private val colabState: TextView
     private val fileName: TextView
     private val fileInfo: TextView
     private val srcValue: TextView
@@ -82,6 +84,28 @@ class DubPage(private val a: MainActivity) {
         kr.addView(Ui.button(a, "إضافة المفتاح", true, R.drawable.ic_paste) { askKey() }, Ui.lp(0, dp(48), 1f))
         keyCard.addView(kr)
         body.addView(keyCard, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(12) })
+
+        // --- free GPU on Google Colab
+        colabCard = Ui.card(a)
+        colabCard.addView(Ui.text(a, 17f, p.text, bold = true).apply { text = "خادم الدبلجة المجاني (Google Colab)" })
+        colabState = Ui.text(a, 14f, p.accent, bold = true).apply { setPadding(0, dp(4), 0, dp(4)) }
+        colabCard.addView(colabState)
+        colabCard.addView(Ui.text(a, 14f, p.sub).apply {
+            text = "1. اضغط «فتح Colab» وسجّل الدخول بحساب Google.\n" +
+                "2. اضغط زر التشغيل ▶ وانتظر 3–5 دقائق حتى تظهر «الخادم جاهز».\n" +
+                "3. اضغط «نسخ الرابط» وارجع إلى هنا، فيتصل التطبيق تلقائيًا.\n" +
+                "اترك صفحة Colab مفتوحة أثناء الدبلجة. الجلسة المجانية تتوقف بعد بضع ساعات، فتعيد تشغيلها عند الحاجة."
+            setLineSpacing(0f, 1.25f)
+            setPadding(0, dp(4), 0, dp(10))
+        })
+        val cr = LinearLayout(a).apply { orientation = LinearLayout.HORIZONTAL }
+        cr.addView(Ui.button(a, "فتح Colab", true, R.drawable.ic_open) {
+            runCatching { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(Dub.COLAB_NOTEBOOK))) }
+        }, Ui.lp(0, dp(48), 1f))
+        cr.addView(View(a), Ui.lp(dp(10), 1))
+        cr.addView(Ui.button(a, "لصق الرابط", false, R.drawable.ic_paste) { checkClipboard(manual = true) }, Ui.lp(0, dp(48), 1f))
+        colabCard.addView(cr)
+        body.addView(colabCard, Ui.lp(Ui.MATCH, Ui.WRAP).apply { bottomMargin = dp(12) })
 
         // --- new dub
         val card = Ui.card(a)
@@ -180,23 +204,28 @@ class DubPage(private val a: MainActivity) {
     private fun buildEngines() {
         val p = Ui.p
         engineRow.removeAllViews()
-        val engines = linkedMapOf("free" to "مجاني على الهاتف", "eleven" to "أصوات أصلية (مدفوع)")
+        val engines = linkedMapOf("free" to "مجاني على الهاتف", "colab" to "أصوات الممثلين (مجاني – Colab)", "eleven" to "أصوات أصلية (مدفوع)")
         for ((code, label) in engines) {
             engineRow.addView(Ui.chip(a, label, code == Dub.engine) {
                 Dub.engine = code
-                if (code == "free") targetLang = "ar"
+                if (code != "eleven") targetLang = "ar"
+                if (code == "colab") checkClipboard(manual = false)
                 buildEngines(); buildTargets(); refresh()
             }, Ui.lp(Ui.WRAP, Ui.WRAP).apply { marginEnd = dp(8) })
         }
         val free = Dub.engine == "free"
-        engineHint.text = if (free)
-            "مجاني بالكامل: يفهم الكلام بنموذج Whisper، ويترجمه بترجمة Google المجانية، وينطقه بصوت عربي من هاتفك، " +
-                "ويخفض الكلام الأصلي مع إبقاء الموسيقى والمؤثرات. الصوت العربي آلي وليس أصوات الممثلين."
-        else "بأصوات الممثلين الأصليين نفسها مع الموسيقى والمؤثرات، عبر خوادم ElevenLabs. يحتاج اشتراكًا مدفوعًا ومفتاحًا."
+        engineHint.text = when (Dub.engine) {
+            "free" -> "مجاني بالكامل على هاتفك: يفهم الكلام بنموذج Whisper، ويترجمه بترجمة Google المجانية، وينطقه بصوت عربي من هاتفك، " +
+                "ويخفض الكلام الأصلي مع إبقاء الموسيقى والمؤثرات. الصوت العربي آلي وواحد لكل الشخصيات."
+            "colab" -> "مجاني عبر بطاقة رسومية من Google Colab: يفصل الأصوات عن الموسيقى، ويميّز كل ممثل، ويترجم، " +
+                "ثم ينطق العربية بصوت كل ممثل نفسه فوق الموسيقى والمؤثرات الأصلية. تديره من هاتفك."
+            else -> "بأصوات الممثلين الأصليين عبر خوادم ElevenLabs. أعلى جودة لكنه يحتاج اشتراكًا مدفوعًا ومفتاحًا."
+        }
         engineHint.setTextColor(p.sub)
         freeBox.visibility = if (free) View.VISIBLE else View.GONE
-        targetTitle.visibility = if (free) View.GONE else View.VISIBLE
-        targetScroll.visibility = if (free) View.GONE else View.VISIBLE
+        val eleven = Dub.engine == "eleven"
+        targetTitle.visibility = if (eleven) View.VISIBLE else View.GONE
+        targetScroll.visibility = if (eleven) View.VISIBLE else View.GONE
         voiceValue.text = if (Dub.voiceName.isBlank()) "الافتراضي" else voiceLabel(Dub.voiceName)
         asrValue.text = Whisper.models[Dub.asrModel]?.third ?: "سريع"
     }
@@ -356,6 +385,23 @@ class DubPage(private val a: MainActivity) {
                 .show()
             return
         }
+        if (Dub.engine == "colab") {
+            if (Dub.colabLink.isBlank()) { a.toast("اتصل بخادم Colab أولًا (الخطوات في الأعلى)"); view.smoothScrollTo(0, 0); return }
+            val minutes = if (durationMs > 0) Math.ceil(durationMs / 60000.0).toInt() else 0
+            val msg = buildString {
+                append("الملف: ").append(pickedName).append("\n")
+                if (minutes > 0) append("المدة: ").append(minutes).append(" دقيقة\n")
+                append("\nمجاني. يُرفع الصوت فقط إلى Colab، وتستغرق الدبلجة عادةً بين نصف مدة الفيديو ومثلها. ")
+                append("أول دبلجة في كل جلسة تأخذ دقائق إضافية لتجهيز النماذج.\n\nاترك صفحة Colab مفتوحة حتى تنتهي.")
+            }
+            AlertDialog.Builder(a)
+                .setTitle("بدء الدبلجة بأصوات الممثلين؟")
+                .setMessage(msg)
+                .setPositiveButton("ابدأ") { _, _ -> launchDub(uri) }
+                .setNegativeButton("إلغاء", null)
+                .show()
+            return
+        }
         if (Dub.apiKey.isBlank()) { askKey(); return }
         val minutes = if (durationMs > 0) Math.ceil(durationMs / 60000.0).toInt() else 0
         val v2 = Dub.model == "dubbing_v2"
@@ -375,6 +421,38 @@ class DubPage(private val a: MainActivity) {
             .setPositiveButton("ابدأ") { _, _ -> launchDub(uri) }
             .setNegativeButton("إلغاء", null)
             .show()
+    }
+
+    /** Picks up the link copied from the Colab page and connects to it. */
+    fun checkClipboard(manual: Boolean) {
+        val cm = a.getSystemService(android.content.ClipboardManager::class.java)
+        val text = runCatching { cm.primaryClip?.getItemAt(0)?.coerceToText(a)?.toString() }.getOrNull().orEmpty()
+        val link = Dub.parseColab(text)
+        if (link == null) {
+            if (manual) a.toast("لم أجد رابط Colab في الحافظة. اضغط «نسخ الرابط» في صفحة Colab أولًا")
+            else if (Dub.colabLink.isNotBlank() && Dub.colabGpu.isBlank()) verifyColab(Dub.colabLink, quiet = true)
+            return
+        }
+        if (!manual && link == Dub.colabLink && Dub.colabGpu.isNotBlank()) return
+        verifyColab(link, quiet = false)
+    }
+
+    private fun verifyColab(link: String, quiet: Boolean) {
+        if (!quiet) a.toast("جارٍ الاتصال بخادم Colab…")
+        Thread {
+            val r = runCatching { Dub.checkColab(link) }
+            a.runOnUiThread {
+                r.onSuccess { gpu ->
+                    Dub.colabLink = link
+                    Dub.colabGpu = gpu
+                    if (!quiet) a.toast("تم الاتصال بخادم Colab ✓")
+                }.onFailure { e ->
+                    Dub.colabGpu = ""
+                    if (!quiet) a.toast(e.message ?: "تعذّر الاتصال")
+                }
+                refresh()
+            }
+        }.start()
     }
 
     private fun launchDub(uri: Uri) {
@@ -485,6 +563,13 @@ class DubPage(private val a: MainActivity) {
     fun refresh() {
         val p = Ui.p
         keyCard.visibility = if (Dub.engine == "eleven" && Dub.apiKey.isBlank()) View.VISIBLE else View.GONE
+        colabCard.visibility = if (Dub.engine == "colab") View.VISIBLE else View.GONE
+        colabState.text = when {
+            Dub.colabLink.isBlank() -> "غير متصل"
+            Dub.colabGpu.isNotBlank() -> "متصل ✓ – " + Dub.colabGpu
+            else -> "رابط محفوظ (اضغط «لصق الرابط» إن كان قديمًا)"
+        }
+        colabState.setTextColor(if (Dub.colabGpu.isNotBlank()) p.success else p.sub)
         val jobs = Dub.snapshot()
         jobsTitle.visibility = if (jobs.isEmpty()) View.GONE else View.VISIBLE
         val ids = jobs.map { it.id }.toSet()
@@ -500,7 +585,7 @@ class DubPage(private val a: MainActivity) {
                 DubStage.TRANSLATING -> (if (j.status.startsWith("تنزيل")) j.status else "الترجمة إلى العربية…") + pct
                 DubStage.VOICING -> "تسجيل الصوت العربي…$pct"
                 DubStage.UPLOADING -> "رفع الصوت إلى ElevenLabs…$pct"
-                DubStage.WAITING -> j.status.ifBlank { "تجري الدبلجة في ElevenLabs…" }
+                DubStage.WAITING -> j.status.ifBlank { "تجري الدبلجة…" } + (if (j.engine == "colab") pct else "")
                 DubStage.DOWNLOADING -> "تنزيل الصوت العربي…$pct"
                 DubStage.MERGING -> "دمج الصوت العربي مع الفيديو…$pct"
                 DubStage.DONE -> "اكتملت الدبلجة • في مجلد Download/Downloader"
@@ -510,7 +595,7 @@ class DubPage(private val a: MainActivity) {
             h.bar.progressTintList = ColorStateList.valueOf(
                 when (j.stage) { DubStage.DONE -> p.success; DubStage.FAILED -> p.danger; else -> p.accent }
             )
-            if (running && (j.progress < 0 || j.stage == DubStage.WAITING)) h.bar.isIndeterminate = true
+            if (running && (j.progress < 0 || (j.stage == DubStage.WAITING && j.engine != "colab"))) h.bar.isIndeterminate = true
             else {
                 h.bar.isIndeterminate = false
                 h.bar.progress = when (j.stage) {
@@ -519,7 +604,8 @@ class DubPage(private val a: MainActivity) {
                     else -> (j.progress.coerceIn(0f, 100f) * 10).toInt()
                 }
             }
-            h.badge.text = if (j.engine == "free") "مجاني • " + (Dub.sourceLanguages[j.sourceLang] ?: j.sourceLang) + " ← العربية"
+            h.badge.text = if (j.engine == "colab") "Colab • أصوات الممثلين"
+            else if (j.engine == "free") "مجاني • " + (Dub.sourceLanguages[j.sourceLang] ?: j.sourceLang) + " ← العربية"
             else (Dub.targetLanguages[j.targetLang] ?: j.targetLang) + " • ElevenLabs " + (if (j.model == "dubbing_v2") "v2" else "v1")
             h.retry.visibility = if (j.stage == DubStage.FAILED) View.VISIBLE else View.GONE
             h.retry.setOnClickListener { Dub.retry(j.id); refresh() }
