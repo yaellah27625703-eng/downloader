@@ -144,7 +144,11 @@ class PcmPlayer(rate: Int, voiceCall: Boolean = false) {
                     k += 2
                 }
                 level = (Math.sqrt(sum / maxOf(1, b.size / 2)) / 6000.0).toFloat().coerceIn(0f, 1f)
-                track.write(b, 0, b.size)
+                try {
+                    track.write(b, 0, b.size)
+                } catch (e: Exception) {
+                    break
+                }
                 pending = queue.size
                 if (queue.isEmpty()) level = 0f
             }

@@ -502,8 +502,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip pyinstaller
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          ENTRY=@@(ls main.py app.py 2>/dev/null | head -1)
-          if [ -z "@@ENTRY" ]; then ENTRY=@@(ls *.py | head -1); fi
+          ENTRY=@@(ls main.py app.py 2>/dev/null | head -1 || true)
+          if [ -z "@@ENTRY" ]; then ENTRY=@@(ls *.py 2>/dev/null | head -1 || true); fi
           pyinstaller --onefile --windowed --name app "@@ENTRY"
           mkdir -p out
           cd dist && for f in *; do cp -r "@@f" "../out/@@{{ runner.os }}-@@f"; done

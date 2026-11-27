@@ -631,7 +631,10 @@ class MainActivity : Activity() {
                 }
             }
         }
-        if (resultCode != RESULT_OK) return
+        if (resultCode != RESULT_OK) {
+            if (requestCode == REQ_CAMERA) cameraUri?.let { try { contentResolver.delete(it, null, null) } catch (e: Exception) {} }
+            return
+        }
         val uris = ArrayList<Uri>()
         when (requestCode) {
             REQ_IMAGES, REQ_FILES, REQ_VIDEO -> {
@@ -882,11 +885,36 @@ class MainActivity : Activity() {
         respond()
     }
 
+    /** A clear message when no configured service can handle the attachments. */
+    private fun missingCapability(req: Req): String? {
+        val atts = req.turns.lastOrNull()?.atts ?: return null
+        if (atts.isEmpty()) return null
+        val chain = Router.autoChain()
+        val vision = chain.any { it.has(Catalog.VISION) }
+        return when {
+            atts.any { it.isImage } && !vision ->
+                "لتحليل الصور أضف مفتاح Gemini المجاني من الإعدادات (أو مفتاح Claude أو OpenAI أو رمز GitHub)."
+            atts.any { it.isVideo } && !Prefs.hasKey("gemini") && !vision ->
+                "لتحليل الفيديو أضف مفتاح Gemini المجاني من الإعدادات."
+            atts.any { it.isAudio } && !Prefs.hasKey("gemini") && !Prefs.hasKey("groq") ->
+                "لفهم الرسائل والملفات الصوتية أضف مفتاح Gemini أو Groq (كلاهما مجاني) من الإعدادات."
+            else -> null
+        }
+    }
+
     private fun respond() {
         val search = searchOn
         val image = imageMode
         val req = buildReq(search, image)
         val reply = Msg(role = "assistant")
+        if (!image) missingCapability(req)?.let { msg ->
+            reply.error = msg
+            chat.msgs.add(reply)
+            addView(reply)
+            saveChat()
+            scrollDown(true)
+            return
+        }
         chat.msgs.add(reply)
         val h = addView(reply)
         h.setStreaming(true)
@@ -1009,7 +1037,7 @@ class MainActivity : Activity() {
 
     private fun scrollDown(force: Boolean) {
         if (!force && !autoScroll) return
-        ui.post { scroll.fullScroll(View.FOCUS_DOWN); input.requestFocus() }
+        ui.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun regenerate(m: Msg) {

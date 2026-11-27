@@ -293,7 +293,10 @@ class ImageActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (resultCode != RESULT_OK) return
+        if (resultCode != RESULT_OK) {
+            if (requestCode == 2) cameraUri?.let { try { contentResolver.delete(it, null, null) } catch (e: Exception) {} }
+            return
+        }
         val uri = if (requestCode == 2) cameraUri else data?.data
         uri ?: return
         exec.execute {

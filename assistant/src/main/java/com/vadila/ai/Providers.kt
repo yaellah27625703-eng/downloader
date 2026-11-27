@@ -295,6 +295,7 @@ object ClaudeApi {
                         extra.append("\n\n📎 ${a.name}: (لقطات من الفيديو مرفقة)")
                         a.text?.let { extra.append("\nنص الكلام في الفيديو:\n").append(it) }
                     }
+                    a.isAudio && a.text != null -> extra.append("\n\n🎙 ${a.name} — نص الكلام المسجَّل:\n").append(a.text)
                     a.text != null -> extra.append("\n\n📎 ${a.name}:\n").append(a.text)
                     else -> extra.append("\n[مرفق لا يستطيع Claude قراءته: ${a.name}]")
                 }
@@ -384,6 +385,7 @@ object OaiApi {
                         a.text?.let { sb.append("\n\n📎 نص الكلام في ${a.name}:\n").append(it) }
                         if (!vision && a.text == null) sb.append("\n[فيديو لا يستطيع هذا النموذج مشاهدته: ${a.name}]")
                     }
+                    a.isAudio && a.text != null -> sb.append("\n\n🎙 ${a.name} — نص الكلام المسجَّل:\n").append(a.text)
                     a.text != null -> sb.append("\n\n📎 ${a.name}:\n").append(a.text)
                     a.isImage -> sb.append("\n[صورة لا يستطيع هذا النموذج رؤيتها: ${a.name}]")
                     else -> sb.append("\n[مرفق لا يستطيع هذا النموذج قراءته: ${a.name}]")
@@ -396,7 +398,18 @@ object OaiApi {
             }
         }
         val body = J.o("model" to b.model, "messages" to msgs, "stream" to true)
-        Net.sse(Net.jsonPost(chatUrl(p), headers(p), body), p.id, cancel) { _, data -> out.add(Decode.openai(data)) }
+        try {
+            Net.sse(Net.jsonPost(chatUrl(p), headers(p), body), p.id, cancel) { _, data -> out.add(Decode.openai(data)) }
+        } catch (e: ApiError) {
+            // some accounts may not stream certain models (e.g. unverified OpenAI organisations): ask once without streaming
+            if (e.kind == Kind.BAD && out.empty && (e.message ?: "").contains("stream", ignoreCase = true)) {
+                body["stream"] = false
+                val j = J.parse(Net.text(Net.jsonPost(chatUrl(p), headers(p), body), p.id, cancel))
+                out.add(Decode.openai(J.write(j)))
+                return
+            }
+            throw e
+        }
     }
 
     private val SKIP = Regex(
