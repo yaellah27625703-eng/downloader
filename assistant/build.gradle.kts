@@ -11,8 +11,11 @@ android {
         applicationId = "com.vadila.ai"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     signingConfigs {
@@ -56,4 +59,6 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // free on-device background removal (Google ML Kit)
     implementation("com.google.android.gms:play-services-mlkit-subject-segmentation:16.0.0-beta1")
+    // offline AI inside the phone (Gemma 4 via Google's LiteRT-LM)
+    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
 }

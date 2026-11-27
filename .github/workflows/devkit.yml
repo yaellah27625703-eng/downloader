@@ -36,9 +36,11 @@ jobs:
           mkdir -p kit
           ls "$ANDROID_HOME/platforms"
           cp "$ANDROID_HOME/platforms/android-35/android.jar" kit/android.jar
-          for d in com.squareup.okhttp3 com.squareup.okio org.jetbrains.kotlin org.jetbrains; do
-            find ~/.gradle/caches/modules-2/files-2.1/$d -name "*.jar" ! -name "*sources*" 2>/dev/null | grep -E "okhttp-4|okio-jvm|kotlin-stdlib-2|annotations-1|annotations-2" | while read f; do cp "$f" kit/; done
+          for d in com.squareup.okhttp3 com.squareup.okio org.jetbrains.kotlin org.jetbrains org.jetbrains.kotlinx com.google.ai.edge.litertlm; do
+            find ~/.gradle/caches/modules-2/files-2.1/$d -name "*.jar" ! -name "*sources*" 2>/dev/null | grep -E "okhttp-4|okio-jvm|kotlin-stdlib-2|annotations-1|annotations-2|kotlinx-coroutines-core-jvm|kotlinx-coroutines-android|litertlm" | while read f; do cp "$f" kit/; done
           done
+          find ~/.gradle/caches/modules-2/files-2.1/com.google.ai.edge.litertlm -type f | tee kit/litertlm-files.txt
+          find ~/.gradle/caches -path "*transformed*" -name "*.so" | grep -i litert | head -40 | tee kit/litertlm-native.txt
           find ~/.gradle/caches -name "classes.jar" -path "*transformed*" | while read f; do
             n=$(echo "$f" | sed -E 's#.*/transformed/([^/]+)/.*#\1#')
             cp "$f" "kit/aar-$n.jar"
