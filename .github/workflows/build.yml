@@ -2,6 +2,9 @@ name: Build APK
 
 on:
   push:
+    paths-ignore:
+      - "assistant/**"
+      - ".github/workflows/assistant.yml"
   workflow_dispatch:
 
 permissions:
@@ -36,7 +39,7 @@ jobs:
         run: |
           chmod +x gradlew
           set -o pipefail
-          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
           cp app/build/outputs/apk/release/*.apk Downloader.apk
 
       - name: Publish build log on failure

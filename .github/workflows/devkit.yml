@@ -1,0 +1,58 @@
+name: devkit
+
+# Packs the Android SDK jar and the libraries of the assistant module, so the code can be compile-checked quickly.
+on:
+  push:
+    paths:
+      - ".github/workflows/devkit.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  kit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve libraries (and compile once)
+        continue-on-error: true
+        run: |
+          chmod +x gradlew
+          ./gradlew :assistant:compileReleaseKotlin --no-daemon > compile.log 2>&1 || true
+          tail -120 compile.log
+
+      - name: Pack
+        run: |
+          set -x
+          mkdir -p kit
+          ls "$ANDROID_HOME/platforms"
+          cp "$ANDROID_HOME/platforms/android-35/android.jar" kit/android.jar
+          for d in com.squareup.okhttp3 com.squareup.okio org.jetbrains.kotlin org.jetbrains; do
+            find ~/.gradle/caches/modules-2/files-2.1/$d -name "*.jar" ! -name "*sources*" 2>/dev/null | grep -E "okhttp-4|okio-jvm|kotlin-stdlib-2|annotations-1|annotations-2" | while read f; do cp "$f" kit/; done
+          done
+          find ~/.gradle/caches -name "classes.jar" -path "*transformed*" | while read f; do
+            n=$(echo "$f" | sed -E 's#.*/transformed/([^/]+)/.*#\1#')
+            cp "$f" "kit/aar-$n.jar"
+          done
+          find assistant/build -name "R.jar" -exec cp {} kit/R.jar \; || true
+          cp compile.log kit/ || true
+          ls -la kit
+          cd kit && zip -q ../devkit.zip *
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: devkit
+          name: devkit
+          body: Development kit (Android SDK jar + libraries) used to compile-check the code.
+          files: devkit.zip
+          prerelease: true
+          make_latest: false

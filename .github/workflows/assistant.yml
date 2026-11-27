@@ -1,0 +1,51 @@
+name: Build AI assistant APK
+
+on:
+  push:
+    paths:
+      - "assistant/**"
+      - ".github/workflows/assistant.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew :assistant:assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+          cp assistant/build/outputs/apk/release/*.apk VadilaAI.apk
+          ls -la VadilaAI.apk
+
+      - name: Publish build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ai-failed-${{ github.run_number }}
+          name: AI failed build ${{ github.run_number }}
+          files: build.log
+          prerelease: true
+          make_latest: false
+
+      - name: Publish release (direct download link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ai-${{ github.run_number }}
+          name: Vadila AI - الإصدار ${{ github.run_number }}
+          body: حمّل ملف VadilaAI.apk من الأسفل وثبّته على هاتفك.
+          files: VadilaAI.apk
+          make_latest: false
