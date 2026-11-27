@@ -30,6 +30,21 @@ jobs:
           ./gradlew :assistant:compileReleaseKotlin --no-daemon > compile.log 2>&1 || true
           tail -120 compile.log
 
+      - name: LiteRT-LM versions and their Java bytecode level
+        run: |
+          set +e
+          mkdir -p kit/litertlm
+          M=https://dl.google.com/android/maven2/com/google/ai/edge/litertlm/litertlm-android
+          curl -sSL "$M/maven-metadata.xml" -o kit/litertlm/maven-metadata.xml
+          cat kit/litertlm/maven-metadata.xml
+          for v in $(grep -o '<version>[^<]*</version>' kit/litertlm/maven-metadata.xml | sed -E 's#</?version>##g' | tail -14); do
+            curl -sSL "$M/$v/litertlm-android-$v.aar" -o /tmp/l.aar || continue
+            rm -rf /tmp/l && mkdir -p /tmp/l && unzip -q -o /tmp/l.aar classes.jar -d /tmp/l || continue
+            c=$(unzip -Z1 /tmp/l/classes.jar | grep '\.class$' | head -1)
+            unzip -p /tmp/l/classes.jar "$c" | head -c 8 | od -An -tu1 | awk -v v="$v" '{print v, "class major", $7*256+$8}' | tee -a kit/litertlm/versions.txt
+            cp /tmp/l/classes.jar "kit/litertlm/litertlm-android-$v.jar"
+          done
+
       - name: Pack
         run: |
           set -x
