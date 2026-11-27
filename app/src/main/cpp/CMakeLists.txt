@@ -22,3 +22,14 @@ if (ANDROID)
     target_link_libraries(dubwhisper PRIVATE log)
     target_compile_options(dubwhisper PRIVATE -O3)
 endif()
+
+# sherpa-onnx (prebuilt C API, downloaded by the CI build into src/main/jniLibs): separation + voice fingerprints
+if (ANDROID)
+    add_library(sherpa-onnx-c-api SHARED IMPORTED)
+    set_target_properties(sherpa-onnx-c-api PROPERTIES
+        IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libsherpa-onnx-c-api.so)
+    add_library(dubsherpa SHARED sherpa_jni.c)
+    target_include_directories(dubsherpa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(dubsherpa PRIVATE sherpa-onnx-c-api m log)
+    target_compile_options(dubsherpa PRIVATE -O2)
+endif()

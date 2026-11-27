@@ -172,7 +172,7 @@ class DubPage(private val a: MainActivity) {
             freeBox.addView(r)
             return v
         }
-        voiceValue = optionRow("الصوت العربي") { pickVoice() }
+        voiceValue = optionRow("صوت الشخصية الرئيسية") { pickVoice() }
         asrValue = optionRow("دقة فهم الكلام") { pickAsr() }
         card.addView(freeBox)
 
@@ -215,8 +215,9 @@ class DubPage(private val a: MainActivity) {
         }
         val free = Dub.engine == "free"
         engineHint.text = when (Dub.engine) {
-            "free" -> "مجاني بالكامل على هاتفك: يفهم الكلام بنموذج Whisper، ويترجمه بترجمة Google المجانية، وينطقه بصوت عربي من هاتفك، " +
-                "ويخفض الكلام الأصلي مع إبقاء الموسيقى والمؤثرات. الصوت العربي آلي وواحد لكل الشخصيات."
+            "free" -> "مجاني بالكامل على هاتفك: يفصل أصوات الشخصيات عن الموسيقى والمؤثرات، ويفهم الكلام (Whisper)، ويميّز كل شخصية " +
+                "ويعطيها صوتًا عربيًا خاصًا بها يناسبها (رجل، امرأة، طفل)، وبعلوّ صوتها الأصلي، فوق الموسيقى والمؤثرات والضحكات الأصلية. " +
+                "الأصوات من محرّك هاتفك (آلية)؛ لأصوات الممثلين أنفسهم اختر Colab."
             "colab" -> "مجاني عبر بطاقة رسومية من Google Colab، بأدق النماذج المجانية: يعزل أصوات الممثلين عن الموسيقى (BS-Roformer)، " +
                 "ويفهم الكلام (Whisper large-v3)، ويميّز كل ممثل، ويترجم (Hunyuan-MT)، ثم ينطق كل جملة بصوت ممثلها ونبرته وانفعاله " +
                 "وبطول الجملة الأصلية (OmniVoice)، فوق الموسيقى والمؤثرات والضحكات الأصلية. تديره من هاتفك."
@@ -369,14 +370,15 @@ class DubPage(private val a: MainActivity) {
         if (!hasAudio) { a.toast("هذا الملف بلا صوت"); return }
         if (Dub.engine == "free") {
             val minutes = if (durationMs > 0) Math.ceil(durationMs / 60000.0).toInt() else 0
-            val first = !Whisper.modelFile(a, Dub.asrModel).exists()
+            val first = !Whisper.modelFile(a, Dub.asrModel).exists() ||
+                !java.io.File(Whisper.modelsDir(a), "spleeter-vocals.fp16.onnx").exists()
             val msg = buildString {
                 append("الملف: ").append(pickedName).append("\n")
                 if (minutes > 0) append("المدة: ").append(minutes).append(" دقيقة\n")
                 append("لغة الفيديو: ").append(Dub.sourceLanguages[sourceLang]).append("\n\n")
                 append("مجاني تمامًا ويعمل على هاتفك. ")
                 append("يستغرق عادةً بين نصف مدة الفيديو وضعفها حسب قوة الهاتف، ويستمر في الخلفية.")
-                if (first) append("\n\nأول مرة فقط: سيُنزَّل نموذج فهم الكلام وحزمة الترجمة، فاتصل بشبكة Wi-Fi.")
+                if (first) append("\n\nأول مرة فقط: ستُنزَّل نماذج فهم الكلام وفصل الأصوات وتمييز الشخصيات (نحو 120 م.ب) وحزمة الترجمة، فاتصل بشبكة Wi-Fi.")
             }
             AlertDialog.Builder(a)
                 .setTitle("بدء الدبلجة المجانية؟")
@@ -584,7 +586,7 @@ class DubPage(private val a: MainActivity) {
                 DubStage.PREPARING -> j.status + pct
                 DubStage.TRANSCRIBING -> "تحويل الكلام إلى نص…$pct"
                 DubStage.TRANSLATING -> (if (j.status.startsWith("تنزيل")) j.status else "الترجمة إلى العربية…") + pct
-                DubStage.VOICING -> "تسجيل الصوت العربي…$pct"
+                DubStage.VOICING -> j.status.ifBlank { "تسجيل الصوت العربي…" } + pct
                 DubStage.UPLOADING -> "رفع الصوت إلى ElevenLabs…$pct"
                 DubStage.WAITING -> j.status.ifBlank { "تجري الدبلجة…" } + (if (j.engine == "colab") pct else "")
                 DubStage.DOWNLOADING -> "تنزيل الصوت العربي…$pct"

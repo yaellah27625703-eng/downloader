@@ -20,6 +20,18 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      - name: sherpa-onnx native libraries (voice separation + voice fingerprints on the phone)
+        run: |
+          set -e
+          V=v2.0.3
+          curl -sSLf --retry 5 -o sherpa.tar.bz2 "https://github.com/k2-fsa/sherpa-onnx/releases/download/$V/sherpa-onnx-$V-android.tar.bz2"
+          echo "2a30b222abae6d5cf544df4a1c27944279449c25dbb9c755097189cb45db1df0  sherpa.tar.bz2" | sha256sum -c -
+          tar xjf sherpa.tar.bz2 ./jniLibs/arm64-v8a/libonnxruntime.so ./jniLibs/arm64-v8a/libsherpa-onnx-c-api.so
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          mv jniLibs/arm64-v8a/*.so app/src/main/jniLibs/arm64-v8a/
+          rm -rf jniLibs sherpa.tar.bz2
+          ls -la app/src/main/jniLibs/arm64-v8a
+
       - name: Build release APK
         run: |
           chmod +x gradlew

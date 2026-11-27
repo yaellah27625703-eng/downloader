@@ -322,17 +322,17 @@ object Dub {
         }
     }
 
-    /** Free, on-phone dubbing: Whisper → translation → phone voice → mix (original voices lowered). */
+    /** Free, on-phone dubbing: separation → Whisper → characters → translation → a voice per character → film mix. */
     private fun runFree(j: DubJob, dir: File, src: File) {
         ensureSource(j, src)
-        val voice = FreeDub.run(ctx, j, dir, src)
+        val res = FreeDub.run(ctx, j, dir, src)
         check(j)
         j.stage = DubStage.MERGING
         j.status = "دمج الصوت العربي مع الفيديو…"
         j.progress = 0f
         val srt = File(dir, "ar.srt")
         val base = j.name.substringBeforeLast('.').take(100).ifBlank { "video" } + " - مدبلج"
-        val out = mixFree(j, src, voice, srt, dir)
+        val out = mixFree(j, src, res, srt, dir)
         j.resultMime = when (out.extension) { "mkv" -> "video/x-matroska"; "m4a" -> "audio/mp4"; else -> "video/mp4" }
         j.resultName = "$base.${out.extension}"
         j.resultUri = Engine.publishFile(j.resultName, j.resultMime, out).toString()
@@ -342,24 +342,40 @@ object Dub {
         dir.deleteRecursively()
     }
 
-    private fun mixFree(j: DubJob, src: File, voice: File, srt: File, dir: File): File {
+    private fun mixFree(j: DubJob, src: File, res: FreeResult, srt: File, dir: File): File {
         val subs = srt.exists() && srt.length() > 0
         val keep = keepOriginal
-        // The Arabic voice pushes the original speech down while it talks; music and effects stay audible.
+        val voice = res.voice
+        val film = res.background != null && res.residual != null && res.background.length() > 0
+        // Separated: music + effects at full level, the original laughs/screams outside the dubbed lines,
+        // and the Arabic voices (already as loud as the original lines).
+        val bed = "[1:a]aformat=sample_fmts=fltp:channel_layouts=stereo[bg];" +
+            "[2:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[rv];" +
+            "[3:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,highpass=f=70[v];" +
+            "[bg][rv][v]amix=inputs=3:duration=first:normalize=0"
+        val filmLimited = "$bed,alimiter=limit=0.89:attack=5:release=60:level=0[mix]"
+        val filmPlain = "$bed,volume=0.9[mix]"
+        // Not separated: the Arabic voice pushes the original speech down while it talks.
         val ducking = "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=1.5,asplit=2[vk][vm];" +
             "[0:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[orig];" +
             "[orig][vk]sidechaincompress=threshold=0.04:ratio=4:attack=20:release=500[duck];" +
             "[duck][vm]amix=inputs=2:duration=first:normalize=0[mix]"
         val simple = "[0:a:0]aresample=48000,volume=0.3[o];[1:a]aresample=48000,volume=1.5[v];" +
             "[o][v]amix=inputs=2:duration=first[mix]"
-        fun args(filter: String, withSubs: Boolean, out: File, kind: String): List<String> {
-            val a = mutableListOf("-y", "-i", src.absolutePath, "-i", voice.absolutePath)
+        fun args(filter: String, separated: Boolean, withSubs: Boolean, out: File, kind: String): List<String> {
+            val a = mutableListOf("-y", "-i", src.absolutePath)
+            if (separated) {
+                a += listOf("-f", "s16le", "-ar", "44100", "-ac", "2", "-i", res.background!!.absolutePath)
+                a += listOf("-f", "s16le", "-ar", "16000", "-ac", "1", "-i", res.residual!!.absolutePath)
+            }
+            a += listOf("-i", voice.absolutePath)
+            val subIdx = if (separated) 4 else 2
             if (withSubs) a += listOf("-i", srt.absolutePath)
             a += listOf("-filter_complex", filter)
             if (kind != "m4a") a += listOf("-map", "0:v:0")
             a += listOf("-map", "[mix]")
             if (keep && kind != "m4a") a += listOf("-map", "0:a:0")
-            if (withSubs) a += listOf("-map", "2:s:0", "-c:s", if (kind == "mp4") "mov_text" else "srt", "-metadata:s:s:0", "language=ara")
+            if (withSubs) a += listOf("-map", "$subIdx:s:0", "-c:s", if (kind == "mp4") "mov_text" else "srt", "-metadata:s:s:0", "language=ara")
             if (kind != "m4a") a += listOf("-c:v", "copy")
             a += listOf("-c:a", "aac", "-b:a", "192k",
                 "-metadata:s:a:0", "language=ara", "-metadata:s:a:0", "title=العربية", "-disposition:a:0", "default")
@@ -368,19 +384,31 @@ object Dub {
             a += out.absolutePath
             return a
         }
+        class Plan(val filter: String, val separated: Boolean, val subs: Boolean, val out: File)
         val mp4 = File(dir, "out.mp4"); val mkv = File(dir, "out.mkv"); val m4a = File(dir, "out.m4a")
-        val plan = if (j.hasVideo) listOfNotNull(
-            if (subs) Triple(ducking, true, mp4) else null,
-            Triple(ducking, false, mp4),
-            Triple(simple, false, mp4),
-            Triple(simple, false, mkv),
-        ) else listOf(Triple(ducking, false, m4a), Triple(simple, false, m4a))
-        for ((filter, withSubs, out) in plan) {
+        val plan = ArrayList<Plan>()
+        if (j.hasVideo) {
+            if (film) {
+                if (subs) plan += Plan(filmLimited, true, true, mp4)
+                plan += Plan(filmLimited, true, false, mp4)
+                plan += Plan(filmPlain, true, false, mp4)
+                plan += Plan(filmPlain, true, false, mkv)
+            }
+            if (subs) plan += Plan(ducking, false, true, mp4)
+            plan += Plan(ducking, false, false, mp4)
+            plan += Plan(simple, false, false, mp4)
+            plan += Plan(simple, false, false, mkv)
+        } else {
+            if (film) { plan += Plan(filmLimited, true, false, m4a); plan += Plan(filmPlain, true, false, m4a) }
+            plan += Plan(ducking, false, false, m4a)
+            plan += Plan(simple, false, false, m4a)
+        }
+        for (pl in plan) {
             check(j)
-            out.delete()
-            val kind = out.extension
-            val rc = Ffmpeg.run(ctx, args(filter, withSubs, out, kind), j.durationMs, onProcess = { j.process = it }) { j.progress = it }
-            if (rc == 0 && out.length() > 0) return out
+            pl.out.delete()
+            val rc = Ffmpeg.run(ctx, args(pl.filter, pl.separated, pl.subs, pl.out, pl.out.extension), j.durationMs,
+                onProcess = { j.process = it }) { j.progress = it }
+            if (rc == 0 && pl.out.length() > 0) return pl.out
         }
         throw IOException("تعذّر دمج الصوت العربي مع الفيديو")
     }
@@ -744,5 +772,18 @@ object Ffmpeg {
             }
         }
         return p.waitFor()
+    }
+
+    /** Starts FFmpeg with its output on stdout (e.g. raw PCM) for the caller to read; errors go to [log]. */
+    fun pipe(ctx: Context, args: List<String>, log: File): Process {
+        Media.ensureInit(ctx)
+        val bin = File(ctx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
+        val base = File(ctx.noBackupFilesDir, "youtubedl-android/packages")
+        val ld = listOf("python", "ffmpeg", "aria2c").joinToString(":") { File(base, "$it/usr/lib").absolutePath }
+        val pb = ProcessBuilder(listOf(bin.absolutePath, "-hide_banner", "-nostdin", "-loglevel", "error") + args)
+            .redirectError(log)
+        pb.environment()["LD_LIBRARY_PATH"] = ld
+        pb.environment()["TMPDIR"] = ctx.cacheDir.absolutePath
+        return pb.start()
     }
 }

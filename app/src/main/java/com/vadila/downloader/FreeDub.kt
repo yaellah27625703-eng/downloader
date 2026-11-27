@@ -10,6 +10,8 @@ import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -22,8 +24,10 @@ import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /** whisper.cpp (speech-to-text with timestamps), compiled into the app. */
 object Whisper {
@@ -50,13 +54,18 @@ object Whisper {
         "small" to Triple("ggml-small-q5_1.bin", 190_085_487L, "دقيق (181 م.ب)"),
     )
 
-    fun modelFile(ctx: Context, key: String) = File(ctx.getExternalFilesDir("models") ?: ctx.filesDir, models.getValue(key).first)
+    fun modelFile(ctx: Context, key: String) = File(modelsDir(ctx), models.getValue(key).first)
+
+    fun modelsDir(ctx: Context): File = ctx.getExternalFilesDir("models") ?: ctx.filesDir
 }
 
-/** One spoken line: start/end (ms), original text, Arabic text. */
-class Line(val t0: Long, val t1: Long, val text: String, var ar: String = "")
+/** One spoken line: start/end (ms), original text, Arabic text, speaker (-1 = not known yet), pitch (Hz). */
+class Line(val t0: Long, val t1: Long, val text: String, var ar: String = "", var spk: Int = -1, var f0: Double = 0.0)
 
-/** The phone's own Text-to-Speech engine, used for the Arabic voice. */
+/** What the phone pipeline produced: the Arabic voices, and (when separation worked) the music/effects bed. */
+class FreeResult(val voice: File, val background: File?, val residual: File?, val characters: Int)
+
+/** The phone's own Text-to-Speech engine, used for the Arabic voices. */
 class ArabicVoice(ctx: Context) {
     private val ready = CountDownLatch(1)
     @Volatile private var ok = false
@@ -64,24 +73,34 @@ class ArabicVoice(ctx: Context) {
         ok = status == TextToSpeech.SUCCESS
         ready.countDown()
     }
+    private var cached: List<Voice>? = null
+    private var current = ""
+    private var currentPitch = 1f
 
     fun awaitReady(): Boolean {
         ready.await(20, TimeUnit.SECONDS)
         return ok
     }
 
-    fun arabicVoices(): List<Voice> = runCatching {
+    fun arabicVoices(): List<Voice> = cached ?: runCatching {
         tts.voices.orEmpty().filter { it.locale.language == "ar" }.sortedWith(
             compareBy<Voice> { it.isNetworkConnectionRequired }.thenBy { it.name }
         )
-    }.getOrDefault(emptyList())
+    }.getOrDefault(emptyList()).also { if (it.isNotEmpty()) cached = it }
 
     fun hasArabic(): Boolean =
         tts.isLanguageAvailable(Locale("ar")) >= TextToSpeech.LANG_AVAILABLE
 
-    fun use(voiceName: String) {
-        val v = arabicVoices().firstOrNull { it.name == voiceName } ?: arabicVoices().firstOrNull()
-        if (v != null) tts.setVoice(v) else tts.setLanguage(Locale("ar"))
+    fun use(voiceName: String) = select(voiceName, 1f)
+
+    /** Switches to [voiceName] at [pitch] (1 = normal). */
+    fun select(voiceName: String, pitch: Float) {
+        if (voiceName != current || current.isEmpty()) {
+            val v = arabicVoices().firstOrNull { it.name == voiceName } ?: arabicVoices().firstOrNull()
+            if (v != null) tts.setVoice(v) else tts.setLanguage(Locale("ar"))
+            current = v?.name ?: voiceName
+        }
+        if (pitch != currentPitch) { tts.setPitch(pitch); currentPitch = pitch }
     }
 
     fun speak(text: String) {
@@ -110,67 +129,142 @@ class ArabicVoice(ctx: Context) {
     fun shutdown() = runCatching { tts.stop(); tts.shutdown() }
 }
 
-/** The free, on-phone dubbing pipeline. */
+/**
+ * The free, on-phone dubbing pipeline:
+ * 1. separate the voices from the music and effects (Spleeter, on the phone's CPU)
+ * 2. speech-to-text on the clean voices (Whisper)
+ * 3. who speaks each line (voice fingerprints + pitch)
+ * 4. translation to Arabic (ML Kit)
+ * 5. a different Arabic voice for every character, as loud as the original line
+ * 6. the original laughs/screams/breaths outside the dubbed lines are kept
+ */
 object FreeDub {
     private const val SR = 16000            // Whisper input rate
     private const val OUT_SR = 24000         // Arabic voice track rate
     private const val CHUNK_SEC = 600        // transcribe 10 minutes at a time
+    private const val REL = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+    private const val SPLEETER_URL = "$REL/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2"
+    private const val VOICEPRINT_URL = "$REL/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
 
-    fun run(ctx: Context, j: DubJob, dir: File, src: File): File {
-        // 1. model (downloaded once)
+    fun run(ctx: Context, j: DubJob, dir: File, src: File): FreeResult {
+        // 1. speech-recognition model (downloaded once)
         val model = Whisper.modelFile(ctx, j.asrModel)
         ensureModel(j, model)
 
-        // 2. transcription (cached so a retry doesn't redo it)
+        // 2. voices / music + effects
+        val separated = separate(ctx, j, dir, src)
+        val pcm = if (separated) File(dir, "vocals16.pcm") else File(dir, "audio16k.pcm")
+        if (!separated && (!pcm.exists() || pcm.length() == 0L)) {
+            j.stage = DubStage.PREPARING
+            j.status = "تجهيز الصوت…"
+            j.progress = 0f
+            val rc = Ffmpeg.run(ctx, listOf("-y", "-i", src.absolutePath, "-vn", "-ac", "1", "-ar", "$SR", "-f", "s16le", pcm.absolutePath),
+                j.durationMs, onProcess = { j.process = it }) { j.progress = it }
+            if (rc != 0 || pcm.length() == 0L) throw IOException("تعذّر قراءة صوت الفيديو")
+        }
+
+        // 3. speech to text (cached so a retry doesn't redo it)
         val linesFile = File(dir, "lines.json")
         var lines: List<Line> = if (linesFile.exists()) readLines(linesFile) else emptyList()
         if (lines.isEmpty()) {
-            val pcm = File(dir, "audio16k.pcm")
-            if (!pcm.exists() || pcm.length() == 0L) {
-                j.stage = DubStage.PREPARING
-                j.status = "تجهيز الصوت…"
-                j.progress = 0f
-                val rc = Ffmpeg.run(ctx, listOf("-y", "-i", src.absolutePath, "-vn", "-ac", "1", "-ar", "$SR", "-f", "s16le", pcm.absolutePath),
-                    j.durationMs, onProcess = { j.process = it }) { j.progress = it }
-                if (rc != 0 || pcm.length() == 0L) throw IOException("تعذّر قراءة صوت الفيديو")
-            }
             lines = transcribe(j, model, pcm)
             if (lines.isEmpty()) throw IOException("لم يُعثر على كلام في هذا الفيديو")
             writeLines(linesFile, lines)
         }
 
-        // 3. translation to Arabic
+        // 4. who speaks each line
+        if (lines.any { it.spk < 0 }) {
+            lines = speakers(ctx, j, lines, pcm)
+            writeLines(linesFile, lines)
+        }
+
+        // 5. translation to Arabic
         if (lines.any { it.ar.isBlank() }) {
             translate(j, lines)
             writeLines(linesFile, lines)
         }
         writeSrt(File(dir, "ar.srt"), lines)
 
-        // 4. Arabic voice track, each line fitted into its time slot
+        // 6. an Arabic voice for every character, each line fitted into its time slot
         val voice = File(dir, "voice.wav")
-        buildVoiceTrack(ctx, j, lines, voice, dir)
-        return voice
+        val placed = buildVoiceTrack(ctx, j, lines, voice, dir, pcm, separated)
+
+        // 7. the original non-dialogue sounds (laughs, screams, breaths, songs)
+        var residual: File? = null
+        if (separated) {
+            residual = File(dir, "residual16.pcm")
+            val totalMs = pcm.length() / 2 * 1000 / SR
+            pcm.inputStream().buffered(1 shl 20).use { inp ->
+                residual.outputStream().buffered(1 shl 20).use { out -> Separator.residual(inp, out, placed, totalMs) }
+            }
+        }
+        return FreeResult(voice, if (separated) File(dir, "bg44.pcm") else null, residual,
+            lines.map { it.spk }.distinct().size)
     }
 
-    // ------------------------------------------------------------------ model
+    private fun threads() = min(4, max(2, Runtime.getRuntime().availableProcessors() / 2))
+
+    // ------------------------------------------------------------------ models
 
     private fun ensureModel(j: DubJob, model: File) {
         val (name, approx, _) = Whisper.models.getValue(j.asrModel)
         if (model.exists() && model.length() > 1_000_000) return
+        fetch(j, "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$name", model,
+            "تنزيل نموذج التعرّف على الكلام (مرة واحدة فقط)…", approx)
+    }
+
+    /** Spleeter 2-stems (fp16): two small models that split voices from music + effects. */
+    private fun ensureSpleeter(ctx: Context, j: DubJob): Pair<File, File> {
+        val dir = Whisper.modelsDir(ctx).apply { mkdirs() }
+        val voc = File(dir, "spleeter-vocals.fp16.onnx")
+        val acc = File(dir, "spleeter-accompaniment.fp16.onnx")
+        if (voc.length() > 1_000_000 && acc.length() > 1_000_000) return voc to acc
+        val tar = File(dir, "spleeter-2stems-fp16.tar.bz2")
+        fetch(j, SPLEETER_URL, tar, "تنزيل نموذج فصل الأصوات عن الموسيقى (مرة واحدة فقط)…", 35_271_738L)
+        j.status = "تجهيز نموذج فصل الأصوات…"
+        TarArchiveInputStream(BZip2CompressorInputStream(tar.inputStream().buffered(1 shl 16))).use { t ->
+            while (true) {
+                val e = t.nextEntry ?: break
+                val dst = when (e.name.substringAfterLast('/')) {
+                    "vocals.fp16.onnx" -> voc
+                    "accompaniment.fp16.onnx" -> acc
+                    else -> null
+                } ?: continue
+                val part = File(dir, dst.name + ".part")
+                part.outputStream().use { t.copyTo(it, 1 shl 16) }
+                part.renameTo(dst)
+            }
+        }
+        tar.delete()
+        if (voc.length() < 1_000_000 || acc.length() < 1_000_000) throw IOException("نموذج فصل الأصوات ناقص")
+        return voc to acc
+    }
+
+    /** CAM++ voice fingerprints (trained on VoxCeleb). */
+    private fun ensureVoiceprint(ctx: Context, j: DubJob): File {
+        val f = File(Whisper.modelsDir(ctx).apply { mkdirs() }, "campplus_sv_en_voxceleb_16k.onnx")
+        if (f.length() > 1_000_000) return f
+        fetch(j, VOICEPRINT_URL, f, "تنزيل نموذج تمييز الأصوات (مرة واحدة فقط)…", 29_596_979L)
+        return f
+    }
+
+    /** Downloads [url] into [dest], resuming after interruptions. */
+    private fun fetch(j: DubJob, url: String, dest: File, label: String, approx: Long) {
         j.stage = DubStage.PREPARING
-        j.status = "تنزيل نموذج التعرّف على الكلام (مرة واحدة فقط)…"
+        j.status = label
         j.progress = 0f
-        model.parentFile?.mkdirs()
-        val part = File(model.parentFile, "$name.part")
+        dest.parentFile?.mkdirs()
+        val part = File(dest.parentFile, dest.name + ".part")
         var attempt = 0
         while (true) {
             try {
                 val have = if (part.exists()) part.length() else 0L
-                val c = (URL("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$name").openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 20_000; readTimeout = 30_000
+                val c = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 20_000; readTimeout = 30_000; instanceFollowRedirects = true
                     if (have > 0) setRequestProperty("Range", "bytes=$have-")
                 }
                 val code = c.responseCode
+                if (code == 416) { part.renameTo(dest); return }          // already complete
                 if (code !in 200..299) throw IOException("تعذّر تنزيل النموذج ($code)")
                 val append = code == 206
                 val expected = if (c.contentLengthLong > 0) c.contentLengthLong + (if (append) have else 0L) else -1L
@@ -190,12 +284,62 @@ object FreeDub {
                     }
                 }
                 if (expected > 0 && part.length() < expected) throw IOException("انقطع تنزيل النموذج")
-                part.renameTo(model)
+                part.renameTo(dest)
                 return
             } catch (e: IOException) {
                 if (j.cancelled || ++attempt >= 8) throw e
                 Thread.sleep(2000L * attempt)
             }
+        }
+    }
+
+    // ------------------------------------------------------------------ voices / music + effects
+
+    /** Writes bg44.pcm (music + effects, 44.1 kHz stereo) and vocals16.pcm (voices, 16 kHz mono). */
+    private fun separate(ctx: Context, j: DubJob, dir: File, src: File): Boolean {
+        val bg = File(dir, "bg44.pcm")
+        val voc = File(dir, "vocals16.pcm")
+        if (bg.length() > 0 && voc.length() > 0) return true
+        if (!j.hasAudio) return false
+        val models = try { ensureSpleeter(ctx, j) } catch (e: IOException) {
+            if (j.cancelled) throw e
+            return false                      // no model (offline?): dub without separation
+        }
+        j.stage = DubStage.PREPARING
+        j.status = "فصل أصوات الشخصيات عن الموسيقى والمؤثرات…"
+        j.progress = 0f
+        val bgPart = File(dir, "bg44.part")
+        val vocPart = File(dir, "vocals16.part")
+        var h = 0L
+        try {
+            Sherpa.load()
+            h = Sherpa.sepCreate(models.first.absolutePath, models.second.absolutePath, "", threads())
+            if (h == 0L) return false
+            val p = Ffmpeg.pipe(ctx, listOf("-i", src.absolutePath, "-vn", "-ac", "2", "-ar", "44100", "-f", "s16le", "-"),
+                File(dir, "separate.log"))
+            j.process = p
+            val total = max(1L, j.durationMs * 44100 / 1000)
+            try {
+                bgPart.outputStream().buffered(1 shl 20).use { b ->
+                    vocPart.outputStream().buffered(1 shl 20).use { v ->
+                        Separator.run(h, p.inputStream.buffered(1 shl 20), b, v,
+                            progress = { j.progress = (it * 100f / total).coerceAtMost(99f) },
+                            cancelled = { j.cancelled })
+                    }
+                }
+            } finally {
+                p.destroy()
+            }
+            if (bgPart.length() == 0L || vocPart.length() == 0L) return false
+            bgPart.renameTo(bg)
+            vocPart.renameTo(voc)
+            return true
+        } catch (e: Throwable) {
+            if (j.cancelled) throw IOException("أُلغيت")
+            bgPart.delete(); vocPart.delete()
+            return false                      // separation failed: dub without it
+        } finally {
+            if (h != 0L) Sherpa.sepFree(h)
         }
     }
 
@@ -243,7 +387,7 @@ object FreeDub {
                     }
                     for (i in 0 until count) {
                         val text = String(Whisper.segmentText(ctxPtr, i), Charsets.UTF_8).trim()
-                        if (text.isEmpty() || text.startsWith("[") || text.startsWith("(")) continue
+                        if (text.isEmpty() || text.startsWith("[") || text.startsWith("(") || text.startsWith("♪")) continue
                         raw.add(Line(base + Whisper.segmentT0(ctxPtr, i), base + Whisper.segmentT1(ctxPtr, i), text))
                     }
                     start += n
@@ -253,11 +397,45 @@ object FreeDub {
         } finally {
             Whisper.freeContext(ctxPtr)
         }
-        return mergeSentences(raw)
+        return raw
     }
 
-    /** Joins Whisper fragments into whole sentences: better translation and more natural speech. */
-    private fun mergeSentences(raw: List<Line>): List<Line> {
+    // ------------------------------------------------------------------ who speaks each line
+
+    private fun speakers(ctx: Context, j: DubJob, raw: List<Line>, pcm: File): List<Line> {
+        val model = runCatching { ensureVoiceprint(ctx, j) }.getOrNull()
+        if (j.cancelled) throw IOException("أُلغيت")
+        j.stage = DubStage.PREPARING
+        j.status = "تمييز أصوات الشخصيات…"
+        j.progress = 0f
+        val n = raw.size
+        val embs = arrayOfNulls<FloatArray>(n)
+        val pitches = DoubleArray(n)
+        var h = 0L
+        try {
+            if (model != null) runCatching { Sherpa.load(); h = Sherpa.embCreate(model.absolutePath, threads()) }
+            RandomAccessFile(pcm, "r").use { raf ->
+                for ((i, l) in raw.withIndex()) {
+                    if (j.cancelled) throw IOException("أُلغيت")
+                    val x = readPcm(raf, l.t0, l.t1)
+                    pitches[i] = Voices.pitch(if (x.size > SR * 4) x.copyOf(SR * 4) else x, SR)
+                    if (h != 0L && x.size >= SR / 2) embs[i] = runCatching { Sherpa.embCompute(h, x, SR) }.getOrNull()
+                    j.progress = (i + 1) * 100f / n
+                }
+            }
+        } finally {
+            if (h != 0L) Sherpa.embFree(h)
+        }
+        val durs = DoubleArray(n) { (raw[it].t1 - raw[it].t0) / 1000.0 }
+        val starts = DoubleArray(n) { raw[it].t0 / 1000.0 }
+        // no fingerprints (model unavailable): one voice for everyone rather than voices that flip
+        val labels = if (embs.any { it != null }) Voices.speakers(embs.toList(), durs, starts, pitches) else IntArray(n)
+        for (i in 0 until n) { raw[i].spk = labels[i]; raw[i].f0 = pitches[i] }
+        return mergeSameSpeaker(raw)
+    }
+
+    /** Joins consecutive fragments of the same speaker into whole sentences: better translation, more natural speech. */
+    private fun mergeSameSpeaker(raw: List<Line>): List<Line> {
         val out = ArrayList<Line>()
         var cur: Line? = null
         for (l in raw) {
@@ -265,14 +443,26 @@ object FreeDub {
             if (c == null) { cur = l; continue }
             val gap = l.t0 - c.t1
             val ends = c.text.trimEnd().lastOrNull()?.let { it in ".!?؟。！？" } ?: false
-            if (!ends && gap < 700 && c.text.length + l.text.length < 220 && l.t1 - c.t0 < 15000) {
-                cur = Line(c.t0, l.t1, c.text + " " + l.text)
+            if (l.spk == c.spk && !ends && gap < 700 && c.text.length + l.text.length < 220 && l.t1 - c.t0 < 15000) {
+                cur = Line(c.t0, l.t1, c.text + " " + l.text, spk = c.spk, f0 = if (c.f0 > 0) c.f0 else l.f0)
             } else {
                 out.add(c); cur = l
             }
         }
         cur?.let { out.add(it) }
         return out
+    }
+
+    /** 16 kHz mono PCM16 samples between two times (ms). */
+    private fun readPcm(raf: RandomAccessFile, t0: Long, t1: Long): FloatArray {
+        val a = max(0L, t0 * SR / 1000)
+        val b = min(raf.length() / 2, t1 * SR / 1000)
+        if (b <= a) return FloatArray(0)
+        val bytes = ByteArray(((b - a) * 2).toInt())
+        raf.seek(a * 2)
+        raf.readFully(bytes)
+        val sb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        return FloatArray(bytes.size / 2) { sb.get(it) / 32768f }
     }
 
     // ------------------------------------------------------------------ translation
@@ -306,57 +496,123 @@ object FreeDub {
         }
     }
 
-    // ------------------------------------------------------------------ Arabic voice
+    // ------------------------------------------------------------------ Arabic voices
 
-    private fun buildVoiceTrack(ctx: Context, j: DubJob, lines: List<Line>, out: File, dir: File) {
+    /** The phone's Arabic voices and how high each one sounds (measured once, then remembered). */
+    private fun profileVoices(ctx: Context, tts: ArabicVoice, clip: File): List<Voices.PhoneVoice> {
+        val prefs = ctx.getSharedPreferences("voices", Context.MODE_PRIVATE)
+        val all = tts.arabicVoices()
+        val offline = all.filter { !it.isNetworkConnectionRequired }
+        val out = ArrayList<Voices.PhoneVoice>()
+        for (v in (if (offline.isNotEmpty()) offline else all).take(10)) {
+            var f0 = prefs.getFloat("f0_" + v.name, -1f).toDouble()
+            if (f0 < 0) {
+                tts.select(v.name, 1f)
+                f0 = if (tts.toFile("مرحبًا، كيف حالك اليوم؟ أنا بخير، والحمد لله.", 1f, clip)) {
+                    val s = readWav(clip)
+                    Voices.pitch(FloatArray(s.size) { s[it] / 32768f }, OUT_SR)
+                } else 0.0
+                if (f0 <= 0) continue
+                prefs.edit().putFloat("f0_" + v.name, f0.toFloat()).apply()
+            }
+            out.add(Voices.PhoneVoice(v.name, f0))
+        }
+        return out
+    }
+
+    /** Builds the Arabic track; returns the time spans (ms) of the lines that were dubbed. */
+    private fun buildVoiceTrack(ctx: Context, j: DubJob, lines: List<Line>, out: File, dir: File, pcm: File,
+                                matchLoudness: Boolean): List<LongArray> {
         j.stage = DubStage.VOICING
-        j.status = "تسجيل الصوت العربي…"
+        j.status = "تجهيز أصوات الشخصيات…"
         j.progress = 0f
+        val placed = ArrayList<LongArray>()
         val tts = ArabicVoice(ctx)
         try {
             if (!tts.awaitReady()) throw IOException("محرّك الأصوات في الهاتف لا يعمل")
             if (!tts.hasArabic()) throw IOException("لا يوجد صوت عربي في هاتفك. من الإعدادات ← تحويل النص إلى كلام ← ثبّت اللغة العربية، ثم أعد المحاولة")
-            tts.use(j.voiceName)
+            val clip = File(dir, "clip.wav")
+
+            // a voice for every character
+            val phone = runCatching { profileVoices(ctx, tts, clip) }.getOrDefault(emptyList())
+            val speakers = lines.map { it.spk.coerceAtLeast(0) }.distinct().map { id ->
+                val mine = lines.filter { it.spk.coerceAtLeast(0) == id }
+                val f0s = mine.map { it.f0 }.filter { it > 0 }.sorted()
+                Voices.Speaker(id, if (f0s.isEmpty()) 0.0 else f0s[f0s.size / 2], mine.sumOf { (it.t1 - it.t0) / 1000.0 })
+            }
+            val picks = if (phone.isEmpty()) emptyMap() else Voices.assign(speakers, phone, j.voiceName)
+            if (picks.isEmpty()) tts.use(j.voiceName)
+            j.status = if (picks.size > 1) "تسجيل أصوات الشخصيات (${picks.size} أصوات)…" else "تسجيل الصوت العربي…"
 
             val totalMs = max(j.durationMs, (lines.lastOrNull()?.t1 ?: 0L) + 2000)
             val totalSamples = totalMs * OUT_SR / 1000
-            RandomAccessFile(out, "rw").use { track ->
-                track.setLength(0)
-                track.write(wavHeader(totalSamples * 2))
-                track.setLength(44 + totalSamples * 2)   // silence everywhere
-                val clip = File(dir, "clip.wav")
-                var prevEnd = 0L
-                for ((i, l) in lines.withIndex()) {
-                    if (j.cancelled) throw IOException("أُلغيت")
-                    j.progress = i * 100f / lines.size
-                    if (l.ar.isBlank()) continue
-                    val text = l.ar
-                    val next = if (i + 1 < lines.size) lines[i + 1].t0 else totalMs
-                    val start = max(l.t0, prevEnd + 60)
-                    val allowed = max(600L, max(l.t1, next - 120) - start)   // may run into the following pause
-                    if (!tts.toFile(text, 1.0f, clip)) continue
-                    var pcm = readWav(clip)
-                    var dur = pcm.size * 1000L / OUT_SR
-                    if (dur > allowed) {
-                        // too long for its slot: speak faster (natural up to ~1.7x)
-                        val rate = min(1.75f, dur.toFloat() / allowed * 1.05f)
-                        if (tts.toFile(text, rate, clip)) { pcm = readWav(clip); dur = pcm.size * 1000L / OUT_SR }
+            RandomAccessFile(pcm, "r").use { orig ->
+                RandomAccessFile(out, "rw").use { track ->
+                    track.setLength(0)
+                    track.write(wavHeader(totalSamples * 2))
+                    track.setLength(44 + totalSamples * 2)   // silence everywhere
+                    var prevEnd = 0L
+                    for ((i, l) in lines.withIndex()) {
+                        if (j.cancelled) throw IOException("أُلغيت")
+                        j.progress = i * 100f / lines.size
+                        if (l.ar.isBlank()) continue
+                        val text = l.ar
+                        val pick = picks[l.spk.coerceAtLeast(0)]
+                        if (pick != null) tts.select(pick.voice, pick.pitch)
+                        val baseRate = pick?.rate ?: 1f
+                        val next = if (i + 1 < lines.size) lines[i + 1].t0 else totalMs
+                        val start = max(l.t0, prevEnd + 60)
+                        val allowed = max(600L, max(l.t1, next - 120) - start)   // may run into the following pause
+                        if (!tts.toFile(text, baseRate, clip)) continue
+                        var samples = readWav(clip)
+                        var dur = samples.size * 1000L / OUT_SR
+                        if (dur > allowed) {
+                            // too long for its slot: speak faster (natural up to ~1.7x)
+                            val rate = min(1.75f, baseRate * dur.toFloat() / allowed * 1.05f)
+                            if (tts.toFile(text, rate, clip)) { samples = readWav(clip); dur = samples.size * 1000L / OUT_SR }
+                        }
+                        if (matchLoudness) matchLevel(samples, readPcm(orig, l.t0, l.t1))
+                        val bb = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+                        for (s in samples) bb.putShort(s)
+                        val pos = start * OUT_SR / 1000
+                        if (pos + samples.size <= totalSamples) {
+                            track.seek(44 + pos * 2)
+                            track.write(bb.array())
+                            placed.add(longArrayOf(l.t0, l.t1))
+                        }
+                        prevEnd = start + dur
                     }
-                    val bb = ByteBuffer.allocate(pcm.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-                    for (s in pcm) bb.putShort(s)
-                    val pos = start * OUT_SR / 1000
-                    if (pos + pcm.size <= totalSamples) {
-                        track.seek(44 + pos * 2)
-                        track.write(bb.array())
-                    }
-                    prevEnd = start + dur
                 }
-                clip.delete()
             }
+            clip.delete()
             j.progress = 100f
         } finally {
             tts.shutdown()
         }
+        return placed
+    }
+
+    /** Scales the Arabic clip to the loudness of the original line: shouting stays loud, whispers stay soft. */
+    private fun matchLevel(clip: ShortArray, original: FloatArray) {
+        val ref = activeRms(original, SR)
+        val cur = activeRms(FloatArray(clip.size) { clip[it] / 32768f }, OUT_SR)
+        if (ref <= 0 || cur <= 0) return
+        var gain = (max(ref, 0.012) / cur).coerceIn(0.25, 4.0)
+        var peak = 0
+        for (s in clip) peak = max(peak, abs(s.toInt()))
+        if (peak * gain > 32000) gain = 32000.0 / max(1, peak)
+        for (i in clip.indices) clip[i] = (clip[i] * gain).toInt().coerceIn(-32768, 32767).toShort()
+    }
+
+    /** Loudness of the speech itself, ignoring the pauses inside a line. */
+    private fun activeRms(x: FloatArray, sr: Int): Double {
+        val n = max(1, sr / 50)
+        val k = x.size / n
+        if (k < 2) return if (x.isEmpty()) 0.0 else sqrt(x.sumOf { (it * it).toDouble() } / x.size)
+        val e = DoubleArray(k) { f -> var s = 0.0; for (i in f * n until (f + 1) * n) s += x[i] * x[i]; sqrt(s / n) }
+        val thr = (e.maxOrNull() ?: 0.0) * 0.0178            // -35 dB
+        val act = e.filter { it >= thr }
+        return if (act.isEmpty()) 0.0 else sqrt(act.sumOf { it * it } / act.size)
     }
 
     /** Reads a PCM16 WAV and returns mono samples at [OUT_SR]. */
@@ -414,7 +670,8 @@ object FreeDub {
 
     private fun writeLines(f: File, lines: List<Line>) {
         val arr = JSONArray()
-        for (l in lines) arr.put(JSONObject().put("a", l.t0).put("b", l.t1).put("t", l.text).put("ar", l.ar))
+        for (l in lines) arr.put(JSONObject().put("a", l.t0).put("b", l.t1).put("t", l.text).put("ar", l.ar)
+            .put("s", l.spk).put("f", l.f0))
         f.writeText(arr.toString())
     }
 
@@ -422,7 +679,7 @@ object FreeDub {
         val arr = JSONArray(f.readText())
         (0 until arr.length()).map {
             val o = arr.getJSONObject(it)
-            Line(o.getLong("a"), o.getLong("b"), o.getString("t"), o.optString("ar"))
+            Line(o.getLong("a"), o.getLong("b"), o.getString("t"), o.optString("ar"), o.optInt("s", -1), o.optDouble("f", 0.0))
         }
     }.getOrDefault(emptyList())
 

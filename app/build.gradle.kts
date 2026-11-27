@@ -11,8 +11,8 @@ android {
         applicationId = "com.vadila.downloader"
         minSdk = 29
         targetSdk = 34
-        versionCode = 7
-        versionName = "5.2"
+        versionCode = 8
+        versionName = "5.3"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -53,7 +53,8 @@ android {
             useLegacyPackaging = true
         }
         resources {
-            excludes += listOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/*.kotlin_module")
+            excludes += listOf("META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/*.kotlin_module",
+                "META-INF/versions/**", "META-INF/INDEX.LIST")
         }
     }
     lint {
@@ -68,4 +69,6 @@ dependencies {
     implementation("io.github.junkfood02.youtubedl-android:aria2c:0.17.2")
     // Free on-device translation (Google ML Kit)
     implementation("com.google.mlkit:translate:17.0.3")
+    // unpacks the voice-separation model (.tar.bz2) downloaded on first use
+    implementation("org.apache.commons:commons-compress:1.27.1")
 }
