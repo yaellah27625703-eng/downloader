@@ -11,8 +11,8 @@ android {
         applicationId = "com.vadila.downloader"
         minSdk = 29
         targetSdk = 34
-        versionCode = 6
-        versionName = "5.1"
+        versionCode = 7
+        versionName = "5.2"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }

@@ -281,7 +281,7 @@ class SettingsPage(private val a: MainActivity) {
         // About
         val about = section("حول")
         about.addView(Ui.text(a, 14f, p.text).apply {
-            text = "مدير التنزيلات – الإصدار 5.1\nتُحفظ الملفات في مجلد Download/Downloader"
+            text = "مدير التنزيلات – الإصدار 5.2\nتُحفظ الملفات في مجلد Download/Downloader"
             setLineSpacing(0f, 1.3f)
             setPadding(dp(4), dp(4), dp(4), dp(4))
         })
